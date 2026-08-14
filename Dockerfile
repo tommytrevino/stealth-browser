@@ -3,8 +3,13 @@ FROM mcr.microsoft.com/playwright:v1.40.0-jammy
 # Create app directory
 WORKDIR /app
 
+# Install build dependencies for native Node C++ bindings (like better-sqlite3)
+RUN apt-get update && \
+    apt-get install -y python3 build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy package configuration files
-COPY package.json ./
+COPY package.json package-lock.json* ./
 
 # Install npm dependencies
 RUN npm install
