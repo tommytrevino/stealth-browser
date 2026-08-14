@@ -26,6 +26,8 @@ RUN npm run build
 # Start Express server
 EXPOSE 9377
 ENV PORT=9377
+ENV MOZ_DISABLE_CONTENT_SANDBOX=1
+ENV DISABLE_WAYLAND=1
 
 RUN chmod +x start.sh
 CMD ["./start.sh"]
