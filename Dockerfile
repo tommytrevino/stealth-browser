@@ -3,9 +3,9 @@ FROM mcr.microsoft.com/playwright:v1.45.0-jammy
 # Create app directory
 WORKDIR /app
 
-# Install build dependencies for native Node C++ bindings (like better-sqlite3)
+# Install build dependencies for native Node C++ bindings and Xvfb
 RUN apt-get update && \
-    apt-get install -y python3 build-essential && \
+    apt-get install -y python3 build-essential xvfb && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy package configuration files
