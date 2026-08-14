@@ -27,4 +27,4 @@ RUN npm run build
 EXPOSE 9377
 ENV PORT=9377
 
-CMD ["npm", "start"]
+CMD ["xvfb-run", "--server-args=-screen 0 1280x800x24", "npm", "start"]
