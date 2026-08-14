@@ -4,7 +4,7 @@ import { Camoufox } from 'camoufox-js';
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 9377;
+const PORT = 9377;
 const ACCESS_KEY = process.env.PHOTO_RESOLVER_TOKEN || process.env.CAMOFOX_ACCESS_KEY;
 
 // Browser launch options
