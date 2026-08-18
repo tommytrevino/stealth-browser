@@ -80,7 +80,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
         if (!obj) return;
         if (typeof obj === 'string') {
           const isListingImage = 
-            (obj.includes('cdn-redfin.com') || obj.includes('zillowstatic.com')) &&
+            (obj.includes('cdn-redfin.com') || obj.includes('zillowstatic.com') || obj.includes('rdcpix.com')) &&
             (obj.endsWith('.jpg') || obj.endsWith('.jpeg') || obj.endsWith('.png') || obj.includes('width=') || obj.includes('height='));
             
           if (isListingImage) {
@@ -100,7 +100,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
       if (result.imgs) {
         result.imgs.forEach((src: string) => {
           if (!src) return;
-          if (src.includes('ssl.cdn-redfin.com') || src.includes('photos.zillowstatic.com')) {
+          if (src.includes('ssl.cdn-redfin.com') || src.includes('photos.zillowstatic.com') || src.includes('rdcpix.com')) {
             photos.push(src);
           }
         });
