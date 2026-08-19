@@ -47,6 +47,16 @@ async function scrapePhotos(url: string): Promise<string[]> {
   try {
     const page = await browser.newPage();
 
+    // Block heavy resources (images, stylesheets, fonts, media) to save memory and bandwidth
+    await page.route('**/*', (route) => {
+      const type = route.request().resourceType();
+      if (['image', 'stylesheet', 'media', 'font'].includes(type)) {
+        route.abort();
+      } else {
+        route.continue();
+      }
+    });
+
     // Navigate to listing page (with 15s timeout)
     console.log(`[Scraper] Navigating to page...`);
     const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -125,6 +135,27 @@ async function scrapePhotos(url: string): Promise<string[]> {
   }
 }
 
+// Simple lock queue to prevent concurrent browser launches (saves memory)
+let activePromise: Promise<any> = Promise.resolve();
+
+async function scrapeQueue(url: string): Promise<string[]> {
+  const currentPromise = activePromise;
+  
+  // Create a new promise that resolves after the current scrape is completed
+  let resolveNext: (value: any) => void = () => {};
+  activePromise = new Promise((resolve) => {
+    resolveNext = resolve;
+  });
+
+  try {
+    // Wait for the previous scrape to finish
+    await currentPromise;
+    return await scrapePhotos(url);
+  } finally {
+    resolveNext(null);
+  }
+}
+
 // Scrape API endpoint
 app.post('/scrape', async (req: Request, res: Response) => {
   // Simple Authorization header check
@@ -142,7 +173,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
   }
 
   try {
-    const photos = await scrapePhotos(url);
+    const photos = await scrapeQueue(url);
     res.json({ photos });
   } catch (error) {
     console.error(`[Scraper] Scrape failed for ${url}:`, error);
