@@ -10,6 +10,7 @@ const ACCESS_KEY = process.env.PHOTO_RESOLVER_TOKEN || process.env.CAMOFOX_ACCES
 // Browser launch options
 const LAUNCH_OPTIONS: Record<string, any> = {
   headless: true,
+  geoip: true,
   firefoxUserPrefs: {
     'security.sandbox.content.level': 0,
     'security.sandbox.plugin.level': 0,
