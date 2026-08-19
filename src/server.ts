@@ -49,7 +49,11 @@ async function scrapePhotos(url: string): Promise<string[]> {
 
     // Navigate to listing page (with 15s timeout)
     console.log(`[Scraper] Navigating to page...`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const status = response?.status() ?? 0;
+    if (status >= 400) {
+      throw new Error(`Target page returned HTTP status ${status}`);
+    }
 
     // Wait a brief moment to ensure dynamic images begin loading
     await page.waitForTimeout(1000);
