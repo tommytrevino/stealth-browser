@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import { Camoufox } from 'camoufox-js';
+import { request } from 'playwright-core';
 
 const app = express();
 app.use(express.json());
@@ -40,10 +41,61 @@ if (process.env.PROXY_URL) {
   }
 }
 
+function extractPhotosFromHtml(html: string): string[] {
+  // Normalize escaped slashes (\/) in JSON strings to standard slashes (/) first
+  const normalizedHtml = html.replace(/\\\//g, '/');
+  
+  const redfinMatches = normalizedHtml.match(/https:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'>\\,;`]+/g) || [];
+  const zillowMatches = normalizedHtml.match(/https:\/\/photos\.zillowstatic\.com\/fp\/[^\s"'>\\,;`]+/g) || [];
+  const realtorMatches = normalizedHtml.match(/https:\/\/[a-z0-9-.]+\.rdcpix\.com\/[^\s"'>\\,;`]+/g) || [];
+
+  const photos = [...redfinMatches, ...zillowMatches, ...realtorMatches];
+
+  // Clean, de-duplicate, and filter out tracking pixels
+  return Array.from(new Set(photos)).filter(
+    (p) => !p.includes('pixel') && !p.includes('tracking')
+  );
+}
+
 /**
  * Scrapes photos from Zillow or Redfin URL using Camoufox.
  */
 async function scrapePhotos(url: string): Promise<string[]> {
+  // 1. Try fast proxied HTTP GET request first (avoids browser launch overhead entirely)
+  try {
+    console.log(`[Scraper] Attempting fast proxied HTTP GET for URL: ${url}`);
+    const requestContext = await request.newContext({
+      proxy: LAUNCH_OPTIONS.proxy,
+      extraHTTPHeaders: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+      }
+    });
+
+    const response = await requestContext.get(url, { timeout: 10000 });
+    const status = response.status();
+    console.log(`[Scraper] Fast HTTP GET response status: ${status}`);
+
+    if (status === 200) {
+      const html = await response.text();
+      const photos = extractPhotosFromHtml(html);
+      await requestContext.dispose();
+
+      if (photos.length > 0) {
+        console.log(`[Scraper] Fast HTTP GET successful. Extracted ${photos.length} photos.`);
+        return photos;
+      }
+      console.log(`[Scraper] Fast HTTP GET yielded 0 photos. Falling back to browser launch...`);
+    } else {
+      console.log(`[Scraper] Fast HTTP GET returned status ${status}. Falling back to browser launch...`);
+      await requestContext.dispose();
+    }
+  } catch (err) {
+    console.warn(`[Scraper] Fast HTTP GET failed: ${(err as Error).message}. Falling back to browser launch...`);
+  }
+
+  // 2. Fallback to full Camoufox rendering
   console.log(`[Scraper] Launching Camoufox for URL: ${url}`);
   const browser = await Camoufox(LAUNCH_OPTIONS);
 
