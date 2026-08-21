@@ -15,6 +15,9 @@ const LAUNCH_OPTIONS: Record<string, any> = {
     'security.sandbox.content.level': 0,
     'security.sandbox.plugin.level': 0,
     'security.sandbox.level': 0,
+    'webgl.disabled': true,
+    'layers.acceleration.disabled': true,
+    'gfx.webrender.software': true,
   },
 };
 
@@ -69,57 +72,37 @@ async function scrapePhotos(url: string): Promise<string[]> {
     await page.waitForTimeout(1000);
 
     console.log(`[Scraper] Extracting page content...`);
-    // Extract image elements and schema data
     const result = await page.evaluate(() => {
-      // Find URLs in all standard image elements
+      // 1. Gather all raw script text contents (includes JSON-LD, __NEXT_DATA__, Redfin state, etc.)
+      const scriptTexts = Array.from(document.querySelectorAll('script'))
+        .map((s) => s.textContent || '');
+
+      // 2. Gather standard image elements
       const imgs = Array.from(document.images).map((img: HTMLImageElement) => img.src);
 
-      // Find URLs hidden inside JSON-LD scripts
-      const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
-        .map((s: Element) => {
-          try {
-            return JSON.parse(s.textContent || '');
-          } catch {
-            return null;
-          }
-        });
-
-      return { imgs, scripts };
+      return { scriptTexts, imgs };
     });
 
     const photos: string[] = [];
 
     if (result) {
-      // Recursively search nested schema JSON objects for Redfin or Zillow CDN links
-      const searchForImages = (obj: any) => {
-        if (!obj) return;
-        if (typeof obj === 'string') {
-          const isListingImage = 
-            (obj.includes('cdn-redfin.com') || obj.includes('zillowstatic.com') || obj.includes('rdcpix.com')) &&
-            (obj.endsWith('.jpg') || obj.endsWith('.jpeg') || obj.endsWith('.png') || obj.includes('width=') || obj.includes('height='));
-            
-          if (isListingImage) {
-            photos.push(obj);
-          }
-        } else if (Array.isArray(obj)) {
-          obj.forEach(searchForImages);
-        } else if (typeof obj === 'object') {
-          Object.values(obj).forEach(searchForImages);
+      // 1. Search text contents of all script tags using regex patterns for CDN URLs
+      // Normalize escaped slashes (\/) in JSON strings to standard slashes (/) first
+      const fullText = result.scriptTexts.join('\n').replace(/\\\//g, '/');
+      
+      const redfinMatches = fullText.match(/https:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'>\\,;`]+/g) || [];
+      const zillowMatches = fullText.match(/https:\/\/photos\.zillowstatic\.com\/fp\/[^\s"'>\\,;`]+/g) || [];
+      const realtorMatches = fullText.match(/https:\/\/[a-z0-9-.]+\.rdcpix\.com\/[^\s"'>\\,;`]+/g) || [];
+
+      photos.push(...redfinMatches, ...zillowMatches, ...realtorMatches);
+
+      // 2. Search standard image elements
+      result.imgs.forEach((src: string) => {
+        if (!src) return;
+        if (src.includes('ssl.cdn-redfin.com') || src.includes('photos.zillowstatic.com') || src.includes('rdcpix.com')) {
+          photos.push(src);
         }
-      };
-
-      if (result.scripts) {
-        result.scripts.forEach(searchForImages);
-      }
-
-      if (result.imgs) {
-        result.imgs.forEach((src: string) => {
-          if (!src) return;
-          if (src.includes('ssl.cdn-redfin.com') || src.includes('photos.zillowstatic.com') || src.includes('rdcpix.com')) {
-            photos.push(src);
-          }
-        });
-      }
+      });
     }
 
     // Clean, de-duplicate, and filter out tracking pixels
