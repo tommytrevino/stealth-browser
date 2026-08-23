@@ -61,45 +61,40 @@ function extractPhotosFromHtml(html: string): string[] {
  * Scrapes photos from Zillow or Redfin URL using Camoufox.
  */
 async function scrapePhotos(url: string): Promise<string[]> {
-  // 1. Try fast proxied HTTP GET request first (avoids browser launch overhead entirely)
-  try {
-    console.log(`[Scraper] Attempting fast proxied HTTP GET for URL: ${url}`);
-    const requestContext = await request.newContext({
-      proxy: LAUNCH_OPTIONS.proxy,
-      extraHTTPHeaders: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-      }
-    });
-
-    const response = await requestContext.get(url, { timeout: 10000 });
-    const status = response.status();
-    console.log(`[Scraper] Fast HTTP GET response status: ${status}`);
-
-    if (status === 200) {
-      const html = await response.text();
-      const photos = extractPhotosFromHtml(html);
-      await requestContext.dispose();
-
-      if (photos.length > 0) {
-        console.log(`[Scraper] Fast HTTP GET successful. Extracted ${photos.length} photos.`);
-        return photos;
-      }
-      console.log(`[Scraper] Fast HTTP GET yielded 0 photos. Falling back to browser launch...`);
-    } else {
-      console.log(`[Scraper] Fast HTTP GET returned status ${status}. Falling back to browser launch...`);
-      await requestContext.dispose();
-    }
-  } catch (err) {
-    console.warn(`[Scraper] Fast HTTP GET failed: ${(err as Error).message}. Falling back to browser launch...`);
-  }
-
-  // 2. Fallback to full Camoufox rendering
-  console.log(`[Scraper] Launching Camoufox for URL: ${url}`);
+  console.log(`[Scraper] Launching Camoufox browser for URL: ${url}`);
   const browser = await Camoufox(LAUNCH_OPTIONS);
 
   try {
+    // 1. Try fast HTTP GET request routed through the browser's randomized TLS stack first
+    try {
+      console.log(`[Scraper] Attempting fast browser-context HTTP GET...`);
+      const context = await browser.newContext();
+      
+      const response = await context.request.get(url, { timeout: 10000 });
+      const status = response.status();
+      console.log(`[Scraper] Fast browser HTTP GET response status: ${status}`);
+
+      if (status === 200) {
+        const html = await response.text();
+        const photos = extractPhotosFromHtml(html);
+        await context.close();
+
+        if (photos.length > 0) {
+          console.log(`[Scraper] Fast browser HTTP GET successful. Extracted ${photos.length} photos.`);
+          await browser.close();
+          return photos;
+        }
+        console.log(`[Scraper] Fast browser HTTP GET yielded 0 photos. Falling back to page tab rendering...`);
+      } else {
+        console.log(`[Scraper] Fast browser HTTP GET returned status ${status}. Falling back to page tab rendering...`);
+        await context.close();
+      }
+    } catch (err) {
+      console.warn(`[Scraper] Fast browser HTTP GET failed: ${(err as Error).message}. Falling back to page tab rendering...`);
+    }
+
+    // 2. Fallback to full browser page loading and rendering
+    console.log(`[Scraper] Opening page tab for rendering...`);
     const page = await browser.newPage();
 
     // Block heavy resources (images, stylesheets, fonts, media) to save memory and bandwidth
