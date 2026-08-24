@@ -60,40 +60,98 @@ function extractPhotosFromHtml(html: string): string[] {
 /**
  * Scrapes photos from Zillow or Redfin URL using Camoufox.
  */
+function isCaptchaOrBlockPage(html: string): boolean {
+  const lowercase = html.toLowerCase();
+  return (
+    lowercase.includes('captcha') ||
+    lowercase.includes('robot') ||
+    lowercase.includes('human verification') ||
+    lowercase.includes('unusual traffic') ||
+    lowercase.includes('security check') ||
+    lowercase.includes('shield') ||
+    lowercase.includes('recaptcha')
+  );
+}
+
+/**
+ * Scrapes photos from Zillow or Redfin URL using Camoufox.
+ */
 async function scrapePhotos(url: string): Promise<string[]> {
+  // Layer 1: Try standalone HTTP GET request first (requires 0 browser process launch overhead!)
+  try {
+    console.log(`[Scraper] Attempting standalone HTTP GET for URL: ${url}`);
+    const requestContext = await request.newContext({
+      proxy: LAUNCH_OPTIONS.proxy,
+      extraHTTPHeaders: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+      }
+    });
+
+    const response = await requestContext.get(url, { timeout: 8000 });
+    const status = response.status();
+    console.log(`[Scraper] Standalone HTTP GET response status: ${status}`);
+
+    if (status === 200) {
+      const html = await response.text();
+      
+      if (isCaptchaOrBlockPage(html)) {
+        console.log(`[Scraper] Standalone HTTP GET hit a Captcha/Block page.`);
+        await requestContext.dispose();
+      } else {
+        const photos = extractPhotosFromHtml(html);
+        await requestContext.dispose();
+        if (photos.length > 0) {
+          console.log(`[Scraper] Standalone HTTP GET successful. Extracted ${photos.length} photos.`);
+          return photos;
+        }
+      }
+    } else {
+      await requestContext.dispose();
+    }
+  } catch (err) {
+    console.warn(`[Scraper] Standalone HTTP GET failed: ${(err as Error).message}`);
+  }
+
+  // Layer 2: Launch browser & try browser-context request (inherits Camoufox TLS signatures)
   console.log(`[Scraper] Launching Camoufox browser for URL: ${url}`);
   const browser = await Camoufox(LAUNCH_OPTIONS);
 
   try {
-    // 1. Try fast HTTP GET request routed through the browser's randomized TLS stack first
     try {
-      console.log(`[Scraper] Attempting fast browser-context HTTP GET...`);
+      console.log(`[Scraper] Attempting browser-context HTTP GET...`);
       const context = await browser.newContext();
       
       const response = await context.request.get(url, { timeout: 10000 });
       const status = response.status();
-      console.log(`[Scraper] Fast browser HTTP GET response status: ${status}`);
+      console.log(`[Scraper] Browser-context HTTP GET response status: ${status}`);
 
       if (status === 200) {
         const html = await response.text();
+        
+        if (isCaptchaOrBlockPage(html)) {
+          throw new Error('Blocked by bot shield / captcha');
+        }
+
         const photos = extractPhotosFromHtml(html);
         await context.close();
 
         if (photos.length > 0) {
-          console.log(`[Scraper] Fast browser HTTP GET successful. Extracted ${photos.length} photos.`);
+          console.log(`[Scraper] Browser-context HTTP GET successful. Extracted ${photos.length} photos.`);
           await browser.close();
           return photos;
         }
-        console.log(`[Scraper] Fast browser HTTP GET yielded 0 photos. Falling back to page tab rendering...`);
+      } else if (status === 403 || status === 429 || status === 503) {
+        throw new Error(`Target page returned HTTP block status ${status}`);
       } else {
-        console.log(`[Scraper] Fast browser HTTP GET returned status ${status}. Falling back to page tab rendering...`);
         await context.close();
       }
     } catch (err) {
-      console.warn(`[Scraper] Fast browser HTTP GET failed: ${(err as Error).message}. Falling back to page tab rendering...`);
+      console.warn(`[Scraper] Browser-context HTTP GET failed or blocked: ${(err as Error).message}`);
     }
 
-    // 2. Fallback to full browser page loading and rendering
+    // Layer 3: Fallback to full browser page loading and rendering
     console.log(`[Scraper] Opening page tab for rendering...`);
     const page = await browser.newPage();
 
@@ -113,6 +171,11 @@ async function scrapePhotos(url: string): Promise<string[]> {
     const status = response?.status() ?? 0;
     if (status >= 400) {
       throw new Error(`Target page returned HTTP status ${status}`);
+    }
+
+    const html = await page.content();
+    if (isCaptchaOrBlockPage(html)) {
+      throw new Error('Blocked by bot shield / captcha page during render');
     }
 
     // Wait a brief moment to ensure dynamic images begin loading
@@ -156,6 +219,10 @@ async function scrapePhotos(url: string): Promise<string[]> {
     const cleaned = Array.from(new Set(photos)).filter(
       p => !p.includes('pixel') && !p.includes('tracking')
     );
+
+    if (cleaned.length === 0) {
+      throw new Error('No photos extracted from listing page (likely blocked or empty)');
+    }
 
     console.log(`[Scraper] Successfully extracted ${cleaned.length} photos.`);
     return cleaned;
