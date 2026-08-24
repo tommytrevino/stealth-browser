@@ -41,6 +41,35 @@ if (process.env.PROXY_URL) {
   }
 }
 
+class Semaphore {
+  private activeCount = 0;
+  private queue: (() => void)[] = [];
+
+  constructor(private maxConcurrency: number) {}
+
+  async acquire(): Promise<void> {
+    if (this.activeCount < this.maxConcurrency) {
+      this.activeCount++;
+      return;
+    }
+    return new Promise<void>((resolve) => {
+      this.queue.push(resolve);
+    });
+  }
+
+  release(): void {
+    this.activeCount--;
+    const next = this.queue.shift();
+    if (next) {
+      this.activeCount++;
+      next();
+    }
+  }
+}
+
+// Guarantee maximum 3 browser instances at once to stay safe on resource usage
+const browserSemaphore = new Semaphore(3);
+
 function extractPhotosFromHtml(html: string): string[] {
   // Normalize escaped slashes (\/) in JSON strings to standard slashes (/) first
   const normalizedHtml = html.replace(/\\\//g, '/');
@@ -57,19 +86,17 @@ function extractPhotosFromHtml(html: string): string[] {
   );
 }
 
-/**
- * Scrapes photos from Zillow or Redfin URL using Camoufox.
- */
 function isCaptchaOrBlockPage(html: string): boolean {
   const lowercase = html.toLowerCase();
   return (
-    lowercase.includes('captcha') ||
-    lowercase.includes('robot') ||
-    lowercase.includes('human verification') ||
-    lowercase.includes('unusual traffic') ||
-    lowercase.includes('security check') ||
-    lowercase.includes('shield') ||
-    lowercase.includes('recaptcha')
+    lowercase.includes('px-captcha') ||
+    lowercase.includes('perimeterx') ||
+    lowercase.includes('g-recaptcha') ||
+    lowercase.includes('h-captcha') ||
+    lowercase.includes('sec-cpt') ||
+    lowercase.includes('captcha-container') ||
+    (lowercase.includes('access denied') && lowercase.includes('reference #')) ||
+    lowercase.includes('unusual traffic from your computer network')
   );
 }
 
@@ -115,141 +142,127 @@ async function scrapePhotos(url: string): Promise<string[]> {
   }
 
   // Layer 2: Launch browser & try browser-context request (inherits Camoufox TLS signatures)
-  console.log(`[Scraper] Launching Camoufox browser for URL: ${url}`);
-  const browser = await Camoufox(LAUNCH_OPTIONS);
+  console.log(`[Scraper] Entering browser queue for URL: ${url}`);
+  await browserSemaphore.acquire();
 
   try {
+    console.log(`[Scraper] Launching Camoufox browser for URL: ${url}`);
+    const browser = await Camoufox(LAUNCH_OPTIONS);
+
     try {
-      console.log(`[Scraper] Attempting browser-context HTTP GET...`);
-      const context = await browser.newContext();
-      
-      const response = await context.request.get(url, { timeout: 10000 });
-      const status = response.status();
-      console.log(`[Scraper] Browser-context HTTP GET response status: ${status}`);
-
-      if (status === 200) {
-        const html = await response.text();
+      try {
+        console.log(`[Scraper] Attempting browser-context HTTP GET...`);
+        const context = await browser.newContext();
         
-        if (isCaptchaOrBlockPage(html)) {
-          throw new Error('Blocked by bot shield / captcha');
+        const response = await context.request.get(url, { timeout: 10000 });
+        const status = response.status();
+        console.log(`[Scraper] Browser-context HTTP GET response status: ${status}`);
+
+        if (status === 200) {
+          const html = await response.text();
+          
+          if (isCaptchaOrBlockPage(html)) {
+            throw new Error('Blocked by bot shield / captcha');
+          }
+
+          const photos = extractPhotosFromHtml(html);
+          await context.close();
+
+          if (photos.length > 0) {
+            console.log(`[Scraper] Browser-context HTTP GET successful. Extracted ${photos.length} photos.`);
+            return photos;
+          }
+        } else if (status === 403 || status === 429 || status === 503) {
+          throw new Error(`Target page returned HTTP block status ${status}`);
+        } else {
+          await context.close();
         }
-
-        const photos = extractPhotosFromHtml(html);
-        await context.close();
-
-        if (photos.length > 0) {
-          console.log(`[Scraper] Browser-context HTTP GET successful. Extracted ${photos.length} photos.`);
-          await browser.close();
-          return photos;
-        }
-      } else if (status === 403 || status === 429 || status === 503) {
-        throw new Error(`Target page returned HTTP block status ${status}`);
-      } else {
-        await context.close();
+      } catch (err) {
+        console.warn(`[Scraper] Browser-context HTTP GET failed or blocked: ${(err as Error).message}`);
       }
-    } catch (err) {
-      console.warn(`[Scraper] Browser-context HTTP GET failed or blocked: ${(err as Error).message}`);
-    }
 
-    // Layer 3: Fallback to full browser page loading and rendering
-    console.log(`[Scraper] Opening page tab for rendering...`);
-    const page = await browser.newPage();
+      // Layer 3: Fallback to full browser page loading and rendering
+      console.log(`[Scraper] Opening page tab for rendering...`);
+      const page = await browser.newPage();
 
-    // Block heavy resources (images, stylesheets, fonts, media) to save memory and bandwidth
-    await page.route('**/*', (route) => {
-      const type = route.request().resourceType();
-      if (['image', 'stylesheet', 'media', 'font'].includes(type)) {
-        route.abort();
-      } else {
-        route.continue();
-      }
-    });
-
-    // Navigate to listing page (with 15s timeout)
-    console.log(`[Scraper] Navigating to page...`);
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    const status = response?.status() ?? 0;
-    if (status >= 400) {
-      throw new Error(`Target page returned HTTP status ${status}`);
-    }
-
-    const html = await page.content();
-    if (isCaptchaOrBlockPage(html)) {
-      throw new Error('Blocked by bot shield / captcha page during render');
-    }
-
-    // Wait a brief moment to ensure dynamic images begin loading
-    await page.waitForTimeout(1000);
-
-    console.log(`[Scraper] Extracting page content...`);
-    const result = await page.evaluate(() => {
-      // 1. Gather all raw script text contents (includes JSON-LD, __NEXT_DATA__, Redfin state, etc.)
-      const scriptTexts = Array.from(document.querySelectorAll('script'))
-        .map((s) => s.textContent || '');
-
-      // 2. Gather standard image elements
-      const imgs = Array.from(document.images).map((img: HTMLImageElement) => img.src);
-
-      return { scriptTexts, imgs };
-    });
-
-    const photos: string[] = [];
-
-    if (result) {
-      // 1. Search text contents of all script tags using regex patterns for CDN URLs
-      // Normalize escaped slashes (\/) in JSON strings to standard slashes (/) first
-      const fullText = result.scriptTexts.join('\n').replace(/\\\//g, '/');
-      
-      const redfinMatches = fullText.match(/https:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'>\\,;`]+/g) || [];
-      const zillowMatches = fullText.match(/https:\/\/photos\.zillowstatic\.com\/fp\/[^\s"'>\\,;`]+/g) || [];
-      const realtorMatches = fullText.match(/https:\/\/[a-z0-9-.]+\.rdcpix\.com\/[^\s"'>\\,;`]+/g) || [];
-
-      photos.push(...redfinMatches, ...zillowMatches, ...realtorMatches);
-
-      // 2. Search standard image elements
-      result.imgs.forEach((src: string) => {
-        if (!src) return;
-        if (src.includes('ssl.cdn-redfin.com') || src.includes('photos.zillowstatic.com') || src.includes('rdcpix.com')) {
-          photos.push(src);
+      // Block heavy resources (images, stylesheets, fonts, media) to save memory and bandwidth
+      await page.route('**/*', (route) => {
+        const type = route.request().resourceType();
+        if (['image', 'stylesheet', 'media', 'font'].includes(type)) {
+          route.abort();
+        } else {
+          route.continue();
         }
       });
+
+      // Navigate to listing page (with 15s timeout)
+      console.log(`[Scraper] Navigating to page...`);
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      const status = response?.status() ?? 0;
+      if (status >= 400) {
+        throw new Error(`Target page returned HTTP status ${status}`);
+      }
+
+      const html = await page.content();
+      if (isCaptchaOrBlockPage(html)) {
+        throw new Error('Blocked by bot shield / captcha page during render');
+      }
+
+      // Wait a brief moment to ensure dynamic images begin loading
+      await page.waitForTimeout(1000);
+
+      console.log(`[Scraper] Extracting page content...`);
+      const result = await page.evaluate(() => {
+        // 1. Gather all raw script text contents (includes JSON-LD, __NEXT_DATA__, Redfin state, etc.)
+        const scriptTexts = Array.from(document.querySelectorAll('script'))
+          .map((s) => s.textContent || '');
+
+        // 2. Gather standard image elements
+        const imgs = Array.from(document.images).map((img: HTMLImageElement) => img.src);
+
+        return { scriptTexts, imgs };
+      });
+
+      const photos: string[] = [];
+
+      if (result) {
+        // 1. Search text contents of all script tags using regex patterns for CDN URLs
+        // Normalize escaped slashes (\/) in JSON strings to standard slashes (/) first
+        const fullText = result.scriptTexts.join('\n').replace(/\\\//g, '/');
+        
+        const redfinMatches = fullText.match(/https:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'>\\,;`]+/g) || [];
+        const zillowMatches = fullText.match(/https:\/\/photos\.zillowstatic\.com\/fp\/[^\s"'>\\,;`]+/g) || [];
+        const realtorMatches = fullText.match(/https:\/\/[a-z0-9-.]+\.rdcpix\.com\/[^\s"'>\\,;`]+/g) || [];
+
+        photos.push(...redfinMatches, ...zillowMatches, ...realtorMatches);
+
+        // 2. Search standard image elements
+        result.imgs.forEach((src: string) => {
+          if (!src) return;
+          if (src.includes('ssl.cdn-redfin.com') || src.includes('photos.zillowstatic.com') || src.includes('rdcpix.com')) {
+            photos.push(src);
+          }
+        });
+      }
+
+      // Clean, de-duplicate, and filter out tracking pixels
+      const cleaned = Array.from(new Set(photos)).filter(
+        p => !p.includes('pixel') && !p.includes('tracking')
+      );
+
+      if (cleaned.length === 0) {
+        throw new Error('No photos extracted from listing page (likely blocked or empty)');
+      }
+
+      console.log(`[Scraper] Successfully extracted ${cleaned.length} photos.`);
+      return cleaned;
+    } finally {
+      console.log(`[Scraper] Closing Camoufox browser.`);
+      await browser.close();
     }
-
-    // Clean, de-duplicate, and filter out tracking pixels
-    const cleaned = Array.from(new Set(photos)).filter(
-      p => !p.includes('pixel') && !p.includes('tracking')
-    );
-
-    if (cleaned.length === 0) {
-      throw new Error('No photos extracted from listing page (likely blocked or empty)');
-    }
-
-    console.log(`[Scraper] Successfully extracted ${cleaned.length} photos.`);
-    return cleaned;
   } finally {
-    console.log(`[Scraper] Closing Camoufox browser.`);
-    await browser.close();
-  }
-}
-
-// Simple lock queue to prevent concurrent browser launches (saves memory)
-let activePromise: Promise<any> = Promise.resolve();
-
-async function scrapeQueue(url: string): Promise<string[]> {
-  const currentPromise = activePromise;
-  
-  // Create a new promise that resolves after the current scrape is completed
-  let resolveNext: (value: any) => void = () => {};
-  activePromise = new Promise((resolve) => {
-    resolveNext = resolve;
-  });
-
-  try {
-    // Wait for the previous scrape to finish
-    await currentPromise;
-    return await scrapePhotos(url);
-  } finally {
-    resolveNext(null);
+    browserSemaphore.release();
+    console.log(`[Scraper] Released browser queue for URL: ${url}`);
   }
 }
 
@@ -270,7 +283,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
   }
 
   try {
-    const photos = await scrapeQueue(url);
+    const photos = await scrapePhotos(url);
     res.json({ photos });
   } catch (error) {
     console.error(`[Scraper] Scrape failed for ${url}:`, error);
