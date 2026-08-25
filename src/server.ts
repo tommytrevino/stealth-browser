@@ -48,18 +48,22 @@ class TargetBlockedError extends Error {
   }
 }
 
+interface ScrapeRecord {
+  timestamp: number;
+  target: string;
+  success: boolean;
+  blocked: boolean;
+}
+
 interface TargetStats {
   attempts: number;
   successes: number;
   blocks: number;
 }
 
-const stats: Record<string, TargetStats> = {
-  redfin: { attempts: 0, successes: 0, blocks: 0 },
-  zillow: { attempts: 0, successes: 0, blocks: 0 },
-  realtor: { attempts: 0, successes: 0, blocks: 0 },
-  other: { attempts: 0, successes: 0, blocks: 0 },
-};
+// Global rolling history array (last 24 hours)
+const scrapeHistory: ScrapeRecord[] = [];
+const HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000; // 24-hour rolling window
 
 function getUrlTarget(url: string): string {
   const lowercase = url.toLowerCase();
@@ -69,19 +73,63 @@ function getUrlTarget(url: string): string {
   return 'other';
 }
 
-function recordScrapeStart(url: string) {
+function recordScrapeResult(url: string, success: boolean, blocked: boolean) {
   const target = getUrlTarget(url);
-  stats[target].attempts++;
+  scrapeHistory.push({
+    timestamp: Date.now(),
+    target,
+    success,
+    blocked,
+  });
+  pruneHistory();
 }
 
-function recordScrapeSuccess(url: string) {
-  const target = getUrlTarget(url);
-  stats[target].successes++;
+function pruneHistory() {
+  const cutoff = Date.now() - HISTORY_WINDOW_MS;
+  while (scrapeHistory.length > 0 && scrapeHistory[0].timestamp < cutoff) {
+    scrapeHistory.shift();
+  }
 }
 
-function recordScrapeBlock(url: string) {
-  const target = getUrlTarget(url);
-  stats[target].blocks++;
+function getRollingStats(): Record<string, TargetStats> {
+  pruneHistory();
+  const rolling: Record<string, TargetStats> = {
+    redfin: { attempts: 0, successes: 0, blocks: 0 },
+    zillow: { attempts: 0, successes: 0, blocks: 0 },
+    realtor: { attempts: 0, successes: 0, blocks: 0 },
+    other: { attempts: 0, successes: 0, blocks: 0 },
+  };
+
+  for (const entry of scrapeHistory) {
+    rolling[entry.target].attempts++;
+    if (entry.success) rolling[entry.target].successes++;
+    if (entry.blocked) rolling[entry.target].blocks++;
+  }
+
+  return rolling;
+}
+
+function deriveStatus(): string {
+  pruneHistory();
+  if (scrapeHistory.length === 0) return 'ok';
+
+  const rolling = getRollingStats();
+  const targets = Object.keys(rolling).filter((t) => rolling[t].attempts > 0);
+  const totalSuccesses = targets.reduce((sum, t) => sum + rolling[t].successes, 0);
+
+  if (totalSuccesses === 0) {
+    return 'down'; // Completely down (zero successes across all recent attempts)
+  }
+
+  let degraded = false;
+  for (const t of targets) {
+    // If a specific target has at least 3 attempts but 0 successes, the service is degraded
+    if (rolling[t].attempts >= 3 && rolling[t].successes === 0) {
+      degraded = true;
+    }
+  }
+
+  return degraded ? 'degraded' : 'ok';
 }
 
 class Semaphore {
@@ -149,13 +197,16 @@ function getLaunchOptionsForAttempt(attempt: number): Record<string, any> {
     const baseUsername = options.proxy.username;
     // Strip any existing session/id suffixes to prevent build-up
     const cleanUsername = baseUsername.replace(/-session-[\w]+/g, '').replace(/-id-[\w]+/g, '');
-    const randomId = Math.random().toString(36).substring(2, 10);
+    
+    // Webshare does NOT support username session suffixes (it breaks auth).
+    // Only apply session randomizers for providers like Bright Data, Oxylabs, Smartproxy, etc.
     if (options.proxy.server.includes('webshare')) {
-      options.proxy.username = `${cleanUsername}-id-${randomId}`;
+      options.proxy.username = cleanUsername;
     } else {
+      const randomId = Math.random().toString(36).substring(2, 10);
       options.proxy.username = `${cleanUsername}-session-${randomId}`;
+      console.log(`[Scraper] Attempt ${attempt}: Rotating proxy session username to ${options.proxy.username}`);
     }
-    console.log(`[Scraper] Attempt ${attempt}: Rotating proxy session username to ${options.proxy.username}`);
   }
   return options;
 }
@@ -328,7 +379,6 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
  * Scrapes photos from Zillow or Redfin URL using Camoufox with automatic retries and proxy session rotation.
  */
 async function scrapePhotos(url: string): Promise<string[]> {
-  recordScrapeStart(url);
   const maxAttempts = 3;
   let lastError: Error | null = null;
 
@@ -336,17 +386,18 @@ async function scrapePhotos(url: string): Promise<string[]> {
     const options = getLaunchOptionsForAttempt(attempt);
     try {
       const photos = await scrapePhotosAttempt(url, attempt, options);
-      recordScrapeSuccess(url);
+      recordScrapeResult(url, true, false);
       return photos;
     } catch (error) {
       if (error instanceof TargetBlockedError) {
         console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked by target page: ${error.message}. Retrying with fresh proxy session...`);
-        recordScrapeBlock(url);
+        recordScrapeResult(url, false, true);
         lastError = error;
         // Wait a brief moment before retrying (exponential backoff)
         await new Promise((resolve) => setTimeout(resolve, attempt * 500));
       } else {
         // Fatal browser or initialization error — throw immediately
+        recordScrapeResult(url, false, false);
         throw error;
       }
     }
@@ -393,12 +444,12 @@ app.post('/scrape', async (req: Request, res: Response) => {
   }
 });
 
-// Health check with uptime and per-target scrape statistics
+// Health check with dynamic status and rolling statistics
 app.get('/health', (_req: Request, res: Response) => {
   res.json({
-    status: 'ok',
+    status: deriveStatus(),
     uptime: process.uptime(),
-    stats,
+    stats: getRollingStats(),
   });
 });
 
