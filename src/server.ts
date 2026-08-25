@@ -61,9 +61,25 @@ interface TargetStats {
   blocks: number;
 }
 
+interface TargetState {
+  circuit: 'closed' | 'open' | 'half-open';
+  lastStateChange: number;
+  consecutiveBlocks: number;
+}
+
 // Global rolling history array (last 24 hours)
 const scrapeHistory: ScrapeRecord[] = [];
 const HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000; // 24-hour rolling window
+
+const targetStates: Record<string, TargetState> = {
+  redfin: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0 },
+  zillow: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0 },
+  realtor: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0 },
+  other: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0 },
+};
+
+const CIRCUIT_OPEN_DURATION_MS = 5 * 60 * 1000; // 5 minutes in Open state before testing Half-Open
+const BLOCK_THRESHOLD = 5; // 5 consecutive blocks opens the circuit
 
 function getUrlTarget(url: string): string {
   const lowercase = url.toLowerCase();
@@ -71,6 +87,43 @@ function getUrlTarget(url: string): string {
   if (lowercase.includes('zillow.com')) return 'zillow';
   if (lowercase.includes('realtor.com')) return 'realtor';
   return 'other';
+}
+
+function updateCircuitOnSuccess(target: string) {
+  const state = targetStates[target];
+  state.consecutiveBlocks = 0;
+  if (state.circuit !== 'closed') {
+    console.log(`[Circuit Breaker] ${target} is recovered! Closing circuit.`);
+    state.circuit = 'closed';
+    state.lastStateChange = Date.now();
+  }
+}
+
+function updateCircuitOnBlock(target: string) {
+  const state = targetStates[target];
+  state.consecutiveBlocks++;
+  if (state.circuit === 'closed' && state.consecutiveBlocks >= BLOCK_THRESHOLD) {
+    console.warn(`[Circuit Breaker] ${target} hit ${state.consecutiveBlocks} consecutive blocks. Opening circuit.`);
+    state.circuit = 'open';
+    state.lastStateChange = Date.now();
+  } else if (state.circuit === 'half-open') {
+    console.warn(`[Circuit Breaker] ${target} probe failed in half-open state. Re-opening circuit.`);
+    state.circuit = 'open';
+    state.lastStateChange = Date.now();
+  }
+}
+
+function checkCircuit(target: string): 'closed' | 'open' | 'half-open' {
+  const state = targetStates[target];
+  if (state.circuit === 'open') {
+    const elapsed = Date.now() - state.lastStateChange;
+    if (elapsed >= CIRCUIT_OPEN_DURATION_MS) {
+      console.log(`[Circuit Breaker] ${target} open duration expired. Moving to half-open to probe.`);
+      state.circuit = 'half-open';
+      state.lastStateChange = Date.now();
+    }
+  }
+  return state.circuit;
 }
 
 function recordScrapeResult(url: string, success: boolean, blocked: boolean) {
@@ -377,9 +430,20 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
 
 /**
  * Scrapes photos from Zillow or Redfin URL using Camoufox with automatic retries and proxy session rotation.
+ * Integrates an internal Circuit Breaker to prevent consecutive dead target latency from blocking requests.
  */
 async function scrapePhotos(url: string): Promise<string[]> {
-  const maxAttempts = 3;
+  const target = getUrlTarget(url);
+  const circuit = checkCircuit(target);
+
+  if (circuit === 'open') {
+    console.log(`[Circuit Breaker] Skipping request for ${url} (Circuit is OPEN).`);
+    recordScrapeResult(url, false, true);
+    throw new TargetBlockedError(429, `Target page returned HTTP status 429 [Circuit is OPEN]`);
+  }
+
+  // If circuit is half-open, run only 1 attempt (no retries) to probe
+  const maxAttempts = circuit === 'half-open' ? 1 : 3;
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -387,14 +451,17 @@ async function scrapePhotos(url: string): Promise<string[]> {
     try {
       const photos = await scrapePhotosAttempt(url, attempt, options);
       recordScrapeResult(url, true, false);
+      updateCircuitOnSuccess(target);
       return photos;
     } catch (error) {
       if (error instanceof TargetBlockedError) {
-        console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked by target page: ${error.message}. Retrying with fresh proxy session...`);
+        console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked by target page: ${error.message}`);
         recordScrapeResult(url, false, true);
         lastError = error;
         // Wait a brief moment before retrying (exponential backoff)
-        await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+        if (attempt < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+        }
       } else {
         // Fatal browser or initialization error — throw immediately
         recordScrapeResult(url, false, false);
@@ -403,6 +470,8 @@ async function scrapePhotos(url: string): Promise<string[]> {
     }
   }
 
+  // If we reach here, all attempts were blocked by target page
+  updateCircuitOnBlock(target);
   throw lastError || new Error('Scraping failed after max retries');
 }
 
@@ -444,12 +513,23 @@ app.post('/scrape', async (req: Request, res: Response) => {
   }
 });
 
-// Health check with dynamic status and rolling statistics
+// Health check with dynamic status, rolling statistics, and circuit state
 app.get('/health', (_req: Request, res: Response) => {
+  const rolling = getRollingStats();
+  
+  // Format stats with current circuit state
+  const formattedStats = Object.keys(rolling).reduce((acc, key) => {
+    acc[key] = {
+      ...rolling[key],
+      circuit: targetStates[key].circuit,
+    };
+    return acc;
+  }, {} as Record<string, any>);
+
   res.json({
     status: deriveStatus(),
     uptime: process.uptime(),
-    stats: getRollingStats(),
+    stats: formattedStats,
   });
 });
 
