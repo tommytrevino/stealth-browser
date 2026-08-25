@@ -65,6 +65,7 @@ interface TargetState {
   circuit: 'closed' | 'open' | 'half-open';
   lastStateChange: number;
   consecutiveBlocks: number;
+  lastProbeAt: number | null;
 }
 
 // Global rolling history array (last 24 hours)
@@ -72,10 +73,10 @@ const scrapeHistory: ScrapeRecord[] = [];
 const HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000; // 24-hour rolling window
 
 const targetStates: Record<string, TargetState> = {
-  redfin: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0 },
-  zillow: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0 },
-  realtor: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0 },
-  other: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0 },
+  redfin: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
+  zillow: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
+  realtor: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
+  other: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
 };
 
 const CIRCUIT_OPEN_DURATION_MS = 5 * 60 * 1000; // 5 minutes in Open state before testing Half-Open
@@ -121,6 +122,7 @@ function checkCircuit(target: string): 'closed' | 'open' | 'half-open' {
       console.log(`[Circuit Breaker] ${target} open duration expired. Moving to half-open to probe.`);
       state.circuit = 'half-open';
       state.lastStateChange = Date.now();
+      state.lastProbeAt = Date.now();
     }
   }
   return state.circuit;
@@ -517,11 +519,12 @@ app.post('/scrape', async (req: Request, res: Response) => {
 app.get('/health', (_req: Request, res: Response) => {
   const rolling = getRollingStats();
   
-  // Format stats with current circuit state
+  // Format stats with current circuit state and lastProbeAt timestamp
   const formattedStats = Object.keys(rolling).reduce((acc, key) => {
     acc[key] = {
       ...rolling[key],
       circuit: targetStates[key].circuit,
+      lastProbeAt: targetStates[key].lastProbeAt,
     };
     return acc;
   }, {} as Record<string, any>);
