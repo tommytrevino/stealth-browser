@@ -41,6 +41,9 @@ if (process.env.PROXY_URL) {
   }
 }
 
+const BRIGHTDATA_API_KEY = process.env.BRIGHTDATA_API_KEY;
+const BRIGHTDATA_ZONE = process.env.BRIGHTDATA_ZONE || 'web_unlocker1';
+
 class TargetBlockedError extends Error {
   constructor(readonly status: number, message: string) {
     super(message);
@@ -266,7 +269,65 @@ function getLaunchOptionsForAttempt(attempt: number): Record<string, any> {
   return options;
 }
 
+async function scrapeWithBrightData(url: string): Promise<string[]> {
+  if (!BRIGHTDATA_API_KEY) {
+    throw new Error('BRIGHTDATA_API_KEY is not defined');
+  }
+
+  console.log(`[Scraper] Querying Bright Data Web Unlocker for URL: ${url}`);
+  const response = await fetch('https://api.brightdata.com/request', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`
+    },
+    body: JSON.stringify({
+      zone: BRIGHTDATA_ZONE,
+      url: url,
+      format: 'raw'
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`[Scraper] Bright Data API returned status ${response.status}: ${errorText}`);
+    
+    if (response.status === 403 || response.status === 429 || response.status === 503) {
+      throw new TargetBlockedError(response.status, `Target page returned HTTP status ${response.status}`);
+    }
+    throw new Error(`Bright Data API request failed with status ${response.status}`);
+  }
+
+  const html = await response.text();
+  
+  if (isCaptchaOrBlockPage(html)) {
+    throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
+  }
+
+  const photos = extractPhotosFromHtml(html);
+  if (photos.length === 0) {
+    throw new Error('No photos extracted from listing page (likely empty or unrecognized layout)');
+  }
+
+  console.log(`[Scraper] Bright Data Web Unlocker successful. Extracted ${photos.length} photos.`);
+  return photos;
+}
+
 async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>): Promise<string[]> {
+  const target = getUrlTarget(url);
+
+  // Route Zillow and Realtor.com through Bright Data Web Unlocker if configured
+  if ((target === 'zillow' || target === 'realtor') && BRIGHTDATA_API_KEY) {
+    try {
+      return await scrapeWithBrightData(url);
+    } catch (error) {
+      if (error instanceof TargetBlockedError) {
+        throw error;
+      }
+      console.warn(`[Scraper] Bright Data Web Unlocker failed for ${url}: ${(error as Error).message}. Falling back to local Camoufox browser...`);
+    }
+  }
+
   // Layer 1: Try standalone HTTP GET request first (requires 0 browser process launch overhead!)
   try {
     console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET for URL: ${url}`);
