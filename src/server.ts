@@ -48,6 +48,42 @@ class TargetBlockedError extends Error {
   }
 }
 
+interface TargetStats {
+  attempts: number;
+  successes: number;
+  blocks: number;
+}
+
+const stats: Record<string, TargetStats> = {
+  redfin: { attempts: 0, successes: 0, blocks: 0 },
+  zillow: { attempts: 0, successes: 0, blocks: 0 },
+  realtor: { attempts: 0, successes: 0, blocks: 0 },
+  other: { attempts: 0, successes: 0, blocks: 0 },
+};
+
+function getUrlTarget(url: string): string {
+  const lowercase = url.toLowerCase();
+  if (lowercase.includes('redfin.com')) return 'redfin';
+  if (lowercase.includes('zillow.com')) return 'zillow';
+  if (lowercase.includes('realtor.com')) return 'realtor';
+  return 'other';
+}
+
+function recordScrapeStart(url: string) {
+  const target = getUrlTarget(url);
+  stats[target].attempts++;
+}
+
+function recordScrapeSuccess(url: string) {
+  const target = getUrlTarget(url);
+  stats[target].successes++;
+}
+
+function recordScrapeBlock(url: string) {
+  const target = getUrlTarget(url);
+  stats[target].blocks++;
+}
+
 class Semaphore {
   private activeCount = 0;
   private queue: (() => void)[] = [];
@@ -107,17 +143,31 @@ function isCaptchaOrBlockPage(html: string): boolean {
   );
 }
 
-/**
- * Scrapes photos from Zillow or Redfin URL using Camoufox.
- */
-async function scrapePhotos(url: string): Promise<string[]> {
+function getLaunchOptionsForAttempt(attempt: number): Record<string, any> {
+  const options = JSON.parse(JSON.stringify(LAUNCH_OPTIONS));
+  if (options.proxy && options.proxy.username) {
+    const baseUsername = options.proxy.username;
+    // Strip any existing session/id suffixes to prevent build-up
+    const cleanUsername = baseUsername.replace(/-session-[\w]+/g, '').replace(/-id-[\w]+/g, '');
+    const randomId = Math.random().toString(36).substring(2, 10);
+    if (options.proxy.server.includes('webshare')) {
+      options.proxy.username = `${cleanUsername}-id-${randomId}`;
+    } else {
+      options.proxy.username = `${cleanUsername}-session-${randomId}`;
+    }
+    console.log(`[Scraper] Attempt ${attempt}: Rotating proxy session username to ${options.proxy.username}`);
+  }
+  return options;
+}
+
+async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>): Promise<string[]> {
   // Layer 1: Try standalone HTTP GET request first (requires 0 browser process launch overhead!)
   try {
-    console.log(`[Scraper] Attempting standalone HTTP GET for URL: ${url}`);
+    console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET for URL: ${url}`);
     const requestContext = await request.newContext({
-      proxy: LAUNCH_OPTIONS.proxy,
+      proxy: options.proxy,
       extraHTTPHeaders: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, http Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
       }
@@ -125,19 +175,19 @@ async function scrapePhotos(url: string): Promise<string[]> {
 
     const response = await requestContext.get(url, { timeout: 8000 });
     const status = response.status();
-    console.log(`[Scraper] Standalone HTTP GET response status: ${status}`);
+    console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET response status: ${status}`);
 
     if (status === 200) {
       const html = await response.text();
       
       if (isCaptchaOrBlockPage(html)) {
-        console.log(`[Scraper] Standalone HTTP GET hit a Captcha/Block page.`);
+        console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET hit a Captcha/Block page.`);
         await requestContext.dispose();
       } else {
         const photos = extractPhotosFromHtml(html);
         await requestContext.dispose();
         if (photos.length > 0) {
-          console.log(`[Scraper] Standalone HTTP GET successful. Extracted ${photos.length} photos.`);
+          console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET successful. Extracted ${photos.length} photos.`);
           return photos;
         }
       }
@@ -145,25 +195,25 @@ async function scrapePhotos(url: string): Promise<string[]> {
       await requestContext.dispose();
     }
   } catch (err) {
-    console.warn(`[Scraper] Standalone HTTP GET failed: ${(err as Error).message}`);
+    console.warn(`[Scraper] Attempt ${attempt}: Standalone HTTP GET failed: ${(err as Error).message}`);
   }
 
   // Layer 2: Launch browser & try browser-context request (inherits Camoufox TLS signatures)
-  console.log(`[Scraper] Entering browser queue for URL: ${url}`);
+  console.log(`[Scraper] Attempt ${attempt}: Entering browser queue for URL: ${url}`);
   await browserSemaphore.acquire();
 
   try {
-    console.log(`[Scraper] Launching Camoufox browser for URL: ${url}`);
-    const browser = await Camoufox(LAUNCH_OPTIONS);
+    console.log(`[Scraper] Attempt ${attempt}: Launching Camoufox browser for URL: ${url}`);
+    const browser = await Camoufox(options);
 
     try {
       try {
-        console.log(`[Scraper] Attempting browser-context HTTP GET...`);
+        console.log(`[Scraper] Attempt ${attempt}: Attempting browser-context HTTP GET...`);
         const context = await browser.newContext();
         
         const response = await context.request.get(url, { timeout: 10000 });
         const status = response.status();
-        console.log(`[Scraper] Browser-context HTTP GET response status: ${status}`);
+        console.log(`[Scraper] Attempt ${attempt}: Browser-context HTTP GET response status: ${status}`);
 
         if (status === 200) {
           const html = await response.text();
@@ -176,7 +226,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
           await context.close();
 
           if (photos.length > 0) {
-            console.log(`[Scraper] Browser-context HTTP GET successful. Extracted ${photos.length} photos.`);
+            console.log(`[Scraper] Attempt ${attempt}: Browser-context HTTP GET successful. Extracted ${photos.length} photos.`);
             return photos;
           }
         } else if (status === 403 || status === 429 || status === 503) {
@@ -185,11 +235,12 @@ async function scrapePhotos(url: string): Promise<string[]> {
           await context.close();
         }
       } catch (err) {
-        console.warn(`[Scraper] Browser-context HTTP GET failed or blocked: ${(err as Error).message}`);
+        if (err instanceof TargetBlockedError) throw err;
+        console.warn(`[Scraper] Attempt ${attempt}: Browser-context HTTP GET failed or blocked: ${(err as Error).message}`);
       }
 
       // Layer 3: Fallback to full browser page loading and rendering
-      console.log(`[Scraper] Opening page tab for rendering...`);
+      console.log(`[Scraper] Attempt ${attempt}: Opening page tab for rendering...`);
       const page = await browser.newPage();
 
       // Block heavy resources (images, stylesheets, fonts, media) to save memory and bandwidth
@@ -203,7 +254,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
       });
 
       // Navigate to listing page (with 15s timeout)
-      console.log(`[Scraper] Navigating to page...`);
+      console.log(`[Scraper] Attempt ${attempt}: Navigating to page...`);
       const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
       const status = response?.status() ?? 0;
       if (status >= 400) {
@@ -218,7 +269,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
       // Wait a brief moment to ensure dynamic images begin loading
       await page.waitForTimeout(1000);
 
-      console.log(`[Scraper] Extracting page content...`);
+      console.log(`[Scraper] Attempt ${attempt}: Extracting page content...`);
       const result = await page.evaluate(() => {
         // 1. Gather all raw script text contents (includes JSON-LD, __NEXT_DATA__, Redfin state, etc.)
         const scriptTexts = Array.from(document.querySelectorAll('script'))
@@ -261,16 +312,47 @@ async function scrapePhotos(url: string): Promise<string[]> {
         throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
       }
 
-      console.log(`[Scraper] Successfully extracted ${cleaned.length} photos.`);
+      console.log(`[Scraper] Attempt ${attempt}: Successfully extracted ${cleaned.length} photos.`);
       return cleaned;
     } finally {
-      console.log(`[Scraper] Closing Camoufox browser.`);
+      console.log(`[Scraper] Attempt ${attempt}: Closing Camoufox browser.`);
       await browser.close();
     }
   } finally {
     browserSemaphore.release();
-    console.log(`[Scraper] Released browser queue for URL: ${url}`);
+    console.log(`[Scraper] Attempt ${attempt}: Released browser queue for URL: ${url}`);
   }
+}
+
+/**
+ * Scrapes photos from Zillow or Redfin URL using Camoufox with automatic retries and proxy session rotation.
+ */
+async function scrapePhotos(url: string): Promise<string[]> {
+  recordScrapeStart(url);
+  const maxAttempts = 3;
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const options = getLaunchOptionsForAttempt(attempt);
+    try {
+      const photos = await scrapePhotosAttempt(url, attempt, options);
+      recordScrapeSuccess(url);
+      return photos;
+    } catch (error) {
+      if (error instanceof TargetBlockedError) {
+        console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked by target page: ${error.message}. Retrying with fresh proxy session...`);
+        recordScrapeBlock(url);
+        lastError = error;
+        // Wait a brief moment before retrying (exponential backoff)
+        await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+      } else {
+        // Fatal browser or initialization error — throw immediately
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error('Scraping failed after max retries');
 }
 
 // Scrape API endpoint
@@ -311,9 +393,13 @@ app.post('/scrape', async (req: Request, res: Response) => {
   }
 });
 
-// Health check
+// Health check with uptime and per-target scrape statistics
 app.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok' });
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    stats,
+  });
 });
 
 app.listen(Number(PORT), '0.0.0.0', () => {
