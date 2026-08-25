@@ -41,6 +41,13 @@ if (process.env.PROXY_URL) {
   }
 }
 
+class TargetBlockedError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = 'TargetBlockedError';
+  }
+}
+
 class Semaphore {
   private activeCount = 0;
   private queue: (() => void)[] = [];
@@ -110,7 +117,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
     const requestContext = await request.newContext({
       proxy: LAUNCH_OPTIONS.proxy,
       extraHTTPHeaders: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, http Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
       }
@@ -162,7 +169,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
           const html = await response.text();
           
           if (isCaptchaOrBlockPage(html)) {
-            throw new Error('Blocked by bot shield / captcha');
+            throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
           }
 
           const photos = extractPhotosFromHtml(html);
@@ -173,7 +180,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
             return photos;
           }
         } else if (status === 403 || status === 429 || status === 503) {
-          throw new Error(`Target page returned HTTP block status ${status}`);
+          throw new TargetBlockedError(status, `Target page returned HTTP status ${status}`);
         } else {
           await context.close();
         }
@@ -200,12 +207,12 @@ async function scrapePhotos(url: string): Promise<string[]> {
       const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
       const status = response?.status() ?? 0;
       if (status >= 400) {
-        throw new Error(`Target page returned HTTP status ${status}`);
+        throw new TargetBlockedError(status, `Target page returned HTTP status ${status}`);
       }
 
       const html = await page.content();
       if (isCaptchaOrBlockPage(html)) {
-        throw new Error('Blocked by bot shield / captcha page during render');
+        throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
       }
 
       // Wait a brief moment to ensure dynamic images begin loading
@@ -251,7 +258,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
       );
 
       if (cleaned.length === 0) {
-        throw new Error('No photos extracted from listing page (likely blocked or empty)');
+        throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
       }
 
       console.log(`[Scraper] Successfully extracted ${cleaned.length} photos.`);
@@ -287,7 +294,20 @@ app.post('/scrape', async (req: Request, res: Response) => {
     res.json({ photos });
   } catch (error) {
     console.error(`[Scraper] Scrape failed for ${url}:`, error);
-    res.status(500).json({ error: (error as Error).message });
+
+    if (error instanceof TargetBlockedError) {
+      res.statusMessage = error.message;
+      res.status(error.status).json({
+        error: error.message,
+        reason: 'target_blocked',
+        status: error.status
+      });
+    } else {
+      res.status(500).json({
+        error: (error as Error).message,
+        reason: 'resolver_error'
+      });
+    }
   }
 });
 
