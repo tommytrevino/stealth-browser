@@ -219,13 +219,124 @@ class Semaphore {
 // Guarantee maximum 3 browser instances at once to stay safe on resource usage
 const browserSemaphore = new Semaphore(3);
 
+function findPhotosDeep(obj: any): any[] {
+  if (!obj || typeof obj !== 'object') return [];
+  
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const found = findPhotosDeep(item);
+      if (found.length > 0) return found;
+    }
+  } else {
+    if (typeof obj.href === 'string' && obj.href.includes('rdcpix.com')) {
+      return [obj];
+    }
+    for (const key of Object.keys(obj)) {
+      if (key === 'photos' && Array.isArray(obj[key])) {
+        const first = obj[key][0];
+        if (first && (first.href || first.url)) {
+          return obj[key];
+        }
+      }
+      const found = findPhotosDeep(obj[key]);
+      if (found.length > 0) return found;
+    }
+  }
+  return [];
+}
+
+function extractRealtorPhotos(html: string): string[] {
+  const allMatches = html.match(/https:\/\/[a-z0-9-.]+\.rdcpix\.com\/[^\s"'>\\,;`]+/g) || [];
+  const uniqueMatches = Array.from(new Set(allMatches));
+
+  let subjectKeys: string[] = [];
+  try {
+    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    if (nextMatch) {
+      const parsed = JSON.parse(nextMatch[1]);
+      const details = parsed?.props?.pageProps?.initialReduxState?.propertyDetails;
+      let rawPhotos: any[] = [];
+      if (details) {
+        if (Array.isArray(details.photos)) {
+          rawPhotos = details.photos;
+        } else if (Array.isArray(details.augmented_gallery)) {
+          const allPhotos = details.augmented_gallery.find((g: any) => g.key === 'all_photos');
+          if (allPhotos && Array.isArray(allPhotos.photos)) {
+            rawPhotos = allPhotos.photos;
+          }
+        }
+      }
+
+      if (rawPhotos.length === 0) {
+        rawPhotos = findPhotosDeep(parsed);
+      }
+
+      for (const p of rawPhotos) {
+        const href = p?.href || p?.url;
+        if (typeof href === 'string' && href.includes('rdcpix.com')) {
+          const keyMatch = href.match(/\/([a-f0-9]{32})/i);
+          if (keyMatch) {
+            subjectKeys.push(keyMatch[1]);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[Scraper] Failed to parse __NEXT_DATA__ for Realtor:', (err as Error).message);
+  }
+
+  if (subjectKeys.length === 0) {
+    console.warn('[Scraper] Could not isolate Realtor subject property keys. Discarding to prevent wrong gallery.');
+    return [];
+  }
+
+  // Filter unique matches to only keep URLs that contain one of the subject keys
+  const subjectUrls = uniqueMatches.filter((url) => {
+    return subjectKeys.some((key) => url.toLowerCase().includes(key.toLowerCase()));
+  });
+
+  // Group by unique photo index to select the best resolution
+  const photoGroups: Record<string, string[]> = {};
+  for (const url of subjectUrls) {
+    const baseMatch = url.match(/\/([a-f0-9]{32}l-m\d+)/i);
+    if (baseMatch) {
+      const baseKey = baseMatch[1];
+      if (!photoGroups[baseKey]) {
+        photoGroups[baseKey] = [];
+      }
+      photoGroups[baseKey].push(url);
+    }
+  }
+
+  const bestUrls: string[] = [];
+  for (const baseKey of Object.keys(photoGroups)) {
+    const urls = photoGroups[baseKey];
+    
+    // Choose the best resolution url in order of preference
+    const best = 
+      urls.find(u => u.includes('rd-w1280_h960.webp')) ||
+      urls.find(u => u.includes('rd-w960_h720.webp')) ||
+      urls.find(u => u.includes('od-w640_h480.jpg')) ||
+      urls.find(u => u.includes('rd-w480_h360.webp')) ||
+      urls[0]; // fallback
+      
+    bestUrls.push(best);
+  }
+
+  return bestUrls;
+}
+
 function extractPhotosFromHtml(html: string): string[] {
   // Normalize escaped slashes (\/) in JSON strings to standard slashes (/) first
   const normalizedHtml = html.replace(/\\\//g, '/');
   
   const redfinMatches = normalizedHtml.match(/https:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'>\\,;`]+/g) || [];
   const zillowMatches = normalizedHtml.match(/https:\/\/photos\.zillowstatic\.com\/fp\/[^\s"'>\\,;`]+/g) || [];
-  const realtorMatches = normalizedHtml.match(/https:\/\/[a-z0-9-.]+\.rdcpix\.com\/[^\s"'>\\,;`]+/g) || [];
+  
+  let realtorMatches: string[] = [];
+  if (normalizedHtml.includes('rdcpix.com')) {
+    realtorMatches = extractRealtorPhotos(normalizedHtml);
+  }
 
   const photos = [...redfinMatches, ...zillowMatches, ...realtorMatches];
 
