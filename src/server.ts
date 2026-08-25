@@ -415,7 +415,7 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
       );
 
       if (cleaned.length === 0) {
-        throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
+        throw new Error('No photos extracted from listing page (likely empty or unrecognized layout)');
       }
 
       console.log(`[Scraper] Attempt ${attempt}: Successfully extracted ${cleaned.length} photos.`);
