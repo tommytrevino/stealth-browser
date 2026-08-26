@@ -320,7 +320,12 @@ function extractRealtorPhotos(html: string): string[] {
       urls.find(u => u.includes('rd-w480_h360.webp')) ||
       urls[0]; // fallback
       
-    bestUrls.push(best);
+    // Automatically rewrite the URL to the high-resolution rd-w1280_h960.webp format
+    let formattedBest = best;
+    if (!best.includes('rd-w1280_h960.webp')) {
+      formattedBest = best.replace(/([a-f0-9]{32}l-m\d+)(?:[^\/]*)$/i, '$1rd-w1280_h960.webp');
+    }
+    bestUrls.push(formattedBest);
   }
 
   return bestUrls;
