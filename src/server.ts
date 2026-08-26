@@ -355,7 +355,6 @@ function isCaptchaOrBlockPage(html: string): boolean {
   const lowercase = html.toLowerCase();
   return (
     lowercase.includes('px-captcha') ||
-    lowercase.includes('perimeterx') ||
     lowercase.includes('g-recaptcha') ||
     lowercase.includes('h-captcha') ||
     lowercase.includes('sec-cpt') ||
