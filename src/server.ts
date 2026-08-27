@@ -437,10 +437,8 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
     try {
       return await scrapeWithBrightData(url);
     } catch (error) {
-      if (error instanceof TargetBlockedError) {
-        throw error;
-      }
-      console.warn(`[Scraper] Bright Data Web Unlocker failed for ${url}: ${(error as Error).message}. Falling back to local Camoufox browser...`);
+      console.warn(`[Scraper] Bright Data Web Unlocker failed for ${url}: ${(error as Error).message}. No local browser fallback allowed.`);
+      throw error;
     }
   }
 
