@@ -399,7 +399,8 @@ async function scrapeWithBrightData(url: string): Promise<string[]> {
     body: JSON.stringify({
       zone: BRIGHTDATA_ZONE,
       url: url,
-      format: 'raw'
+      format: 'raw',
+      country: 'us'
     })
   });
 
