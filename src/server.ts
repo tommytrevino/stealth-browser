@@ -387,13 +387,16 @@ function getLaunchOptionsForAttempt(attempt: number): Record<string, any> {
   }
   return options;
 }
-
 async function scrapeWithBrightData(url: string): Promise<string[]> {
   if (!BRIGHTDATA_API_KEY) {
     throw new Error('BRIGHTDATA_API_KEY is not defined');
   }
 
-  console.log(`[Scraper] Querying Bright Data Web Unlocker for URL: ${url}`);
+  const target = getUrlTarget(url);
+  // Zillow, Redfin, Homes, and other hosts get 60s to allow slow successes under load. Realtor gets 20s.
+  const timeoutMs = target === 'realtor' ? 20000 : 60000;
+
+  console.log(`[Scraper] Querying Bright Data Web Unlocker for URL: ${url} (Timeout: ${timeoutMs / 1000}s)`);
   const response = await fetch('https://api.brightdata.com/request', {
     method: 'POST',
     headers: {
@@ -406,7 +409,7 @@ async function scrapeWithBrightData(url: string): Promise<string[]> {
       format: 'raw',
       country: 'us'
     }),
-    signal: AbortSignal.timeout(15000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
 
   if (!response.ok) {
@@ -661,7 +664,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
         }
       } else {
         // Fatal browser or initialization error — throw immediately
-        recordScrapeResult(url, false, false);
+        recordScrapeResult(url, false, true);
         throw error;
       }
     }
