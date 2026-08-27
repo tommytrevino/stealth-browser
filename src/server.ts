@@ -393,8 +393,8 @@ async function scrapeWithBrightData(url: string): Promise<string[]> {
   }
 
   const target = getUrlTarget(url);
-  // Zillow, Redfin, Homes, and other hosts get 60s to allow slow successes under load. Realtor gets 20s.
-  const timeoutMs = target === 'realtor' ? 20000 : 60000;
+  // Zillow/Redfin/Homes/other get 25s (slow responses correlate with thin/empty results). Realtor gets 20s.
+  const timeoutMs = target === 'realtor' ? 20000 : 25000;
 
   console.log(`[Scraper] Querying Bright Data Web Unlocker for URL: ${url} (Timeout: ${timeoutMs / 1000}s)`);
   const response = await fetch('https://api.brightdata.com/request', {
