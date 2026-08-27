@@ -79,6 +79,7 @@ const targetStates: Record<string, TargetState> = {
   redfin: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
   zillow: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
   realtor: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
+  homes: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
   other: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
 };
 
@@ -90,6 +91,7 @@ function getUrlTarget(url: string): string {
   if (lowercase.includes('redfin.com')) return 'redfin';
   if (lowercase.includes('zillow.com')) return 'zillow';
   if (lowercase.includes('realtor.com')) return 'realtor';
+  if (lowercase.includes('homes.com')) return 'homes';
   return 'other';
 }
 
@@ -155,6 +157,7 @@ function getRollingStats(): Record<string, TargetStats> {
     redfin: { attempts: 0, successes: 0, blocks: 0 },
     zillow: { attempts: 0, successes: 0, blocks: 0 },
     realtor: { attempts: 0, successes: 0, blocks: 0 },
+    homes: { attempts: 0, successes: 0, blocks: 0 },
     other: { attempts: 0, successes: 0, blocks: 0 },
   };
 
@@ -337,13 +340,14 @@ function extractPhotosFromHtml(html: string): string[] {
   
   const redfinMatches = normalizedHtml.match(/https:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'>\\,;`]+/g) || [];
   const zillowMatches = normalizedHtml.match(/https:\/\/photos\.zillowstatic\.com\/fp\/[^\s"'>\\,;`]+/g) || [];
+  const homesMatches = normalizedHtml.match(/https:\/\/[a-z0-9-.]*homes\.com\/[^\s"'>\\,;`]+/g) || [];
   
   let realtorMatches: string[] = [];
   if (normalizedHtml.includes('rdcpix.com')) {
     realtorMatches = extractRealtorPhotos(normalizedHtml);
   }
 
-  const photos = [...redfinMatches, ...zillowMatches, ...realtorMatches];
+  const photos = [...redfinMatches, ...zillowMatches, ...homesMatches, ...realtorMatches];
 
   // Clean, de-duplicate, and filter out tracking pixels
   return Array.from(new Set(photos)).filter(
@@ -401,7 +405,8 @@ async function scrapeWithBrightData(url: string): Promise<string[]> {
       url: url,
       format: 'raw',
       country: 'us'
-    })
+    }),
+    signal: AbortSignal.timeout(15000)
   });
 
   if (!response.ok) {
@@ -432,8 +437,8 @@ async function scrapeWithBrightData(url: string): Promise<string[]> {
 async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>): Promise<string[]> {
   const target = getUrlTarget(url);
 
-  // Route Zillow and Realtor.com through Bright Data Web Unlocker if configured
-  if ((target === 'zillow' || target === 'realtor') && BRIGHTDATA_API_KEY) {
+  // Route Zillow, Realtor, and Homes.com through Bright Data Web Unlocker if configured
+  if ((target === 'zillow' || target === 'realtor' || target === 'homes') && BRIGHTDATA_API_KEY) {
     try {
       return await scrapeWithBrightData(url);
     } catch (error) {
@@ -609,6 +614,20 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
  * Scrapes photos from Zillow or Redfin URL using Camoufox with automatic retries and proxy session rotation.
  * Integrates an internal Circuit Breaker to prevent consecutive dead target latency from blocking requests.
  */
+function isBlockOrTimeoutError(error: any): boolean {
+  if (error instanceof TargetBlockedError) return true;
+  const msg = error?.message?.toLowerCase() || '';
+  return (
+    error?.name === 'TimeoutError' ||
+    error?.name === 'AbortError' ||
+    msg.includes('timeout') ||
+    msg.includes('abort') ||
+    msg.includes('econnreset') ||
+    msg.includes('etimedout') ||
+    msg.includes('socket hang up')
+  );
+}
+
 async function scrapePhotos(url: string): Promise<string[]> {
   const target = getUrlTarget(url);
   const circuit = checkCircuit(target);
@@ -620,7 +639,7 @@ async function scrapePhotos(url: string): Promise<string[]> {
   }
 
   // If circuit is half-open, or we are routing through Bright Data (which handles retries internally), run only 1 attempt.
-  const isBrightData = (target === 'zillow' || target === 'realtor') && BRIGHTDATA_API_KEY;
+  const isBrightData = (target === 'zillow' || target === 'realtor' || target === 'homes') && BRIGHTDATA_API_KEY;
   const maxAttempts = (circuit === 'half-open' || isBrightData) ? 1 : 3;
   let lastError: Error | null = null;
 
@@ -632,10 +651,10 @@ async function scrapePhotos(url: string): Promise<string[]> {
       updateCircuitOnSuccess(target);
       return photos;
     } catch (error) {
-      if (error instanceof TargetBlockedError) {
-        console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked by target page: ${error.message}`);
+      if (isBlockOrTimeoutError(error)) {
+        console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked or timed out: ${(error as Error).message}`);
         recordScrapeResult(url, false, true);
-        lastError = error;
+        lastError = error instanceof TargetBlockedError ? error : new TargetBlockedError(408, (error as Error).message);
         // Wait a brief moment before retrying (exponential backoff)
         if (attempt < maxAttempts) {
           await new Promise((resolve) => setTimeout(resolve, attempt * 500));
