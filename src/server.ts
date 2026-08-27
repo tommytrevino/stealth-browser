@@ -620,8 +620,9 @@ async function scrapePhotos(url: string): Promise<string[]> {
     throw new TargetBlockedError(429, `Target page returned HTTP status 429 [Circuit is OPEN]`);
   }
 
-  // If circuit is half-open, run only 1 attempt (no retries) to probe
-  const maxAttempts = circuit === 'half-open' ? 1 : 3;
+  // If circuit is half-open, or we are routing through Bright Data (which handles retries internally), run only 1 attempt.
+  const isBrightData = (target === 'zillow' || target === 'realtor') && BRIGHTDATA_API_KEY;
+  const maxAttempts = (circuit === 'half-open' || isBrightData) ? 1 : 3;
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
