@@ -5,7 +5,7 @@ import { request } from 'playwright-core';
 const app = express();
 app.use(express.json());
 
-const PORT = 9377;
+const PORT = process.env.PORT || 9377;
 const ACCESS_KEY = process.env.PHOTO_RESOLVER_TOKEN || process.env.CAMOFOX_ACCESS_KEY;
 
 // Browser launch options
@@ -387,7 +387,112 @@ function getLaunchOptionsForAttempt(attempt: number): Record<string, any> {
   }
   return options;
 }
-async function scrapeWithBrightData(url: string): Promise<string[]> {
+export interface SaleHistoryEntry {
+  date: string;
+  event: string;
+  price: number | null;
+  source: string | null;
+}
+
+export interface ScrapeResult {
+  photos: string[];
+  daysOnMarket: number | null;
+  listPrice: number | null;
+  saleHistory: SaleHistoryEntry[];
+}
+
+function extractRedfinMetadata(html: string): {
+  daysOnMarket: number | null;
+  listPrice: number | null;
+  saleHistory: SaleHistoryEntry[];
+} {
+  let daysOnMarket: number | null = null;
+  let listPrice: number | null = null;
+  const saleHistory: SaleHistoryEntry[] = [];
+
+  try {
+    // 1. Days On Market
+    const domMatch1 = html.match(/Days\s+On\s+Market:\s*(\d+)/i);
+    if (domMatch1) {
+      daysOnMarket = parseInt(domMatch1[1], 10);
+    } else {
+      const domMatch2 = html.match(/"amenityName":"Days On Market".*?"amenityValues":\["(\d+)"\]/i);
+      if (domMatch2) {
+        daysOnMarket = parseInt(domMatch2[1], 10);
+      } else {
+        const domMatch3 = html.match(/<li[^>]*>\s*Days On Market\s*:\s*(\d+)\s*<\/li>/i);
+        if (domMatch3) {
+          daysOnMarket = parseInt(domMatch3[1], 10);
+        }
+      }
+    }
+
+    // 2. Sale History
+    const tableIdx = html.indexOf('PropertyHistoryEventTable');
+    if (tableIdx !== -1) {
+      const tableHtml = html.substring(tableIdx, tableIdx + 30000);
+      const rowRegex = /<div class="BasicTable__row([^"]*)"[^>]*>([\s\S]*?)<\/div>(?=<div class="BasicTable__row|<div class="ExpandablePreview|$)/g;
+      let currentSource: string | null = null;
+      let match: RegExpExecArray | null;
+
+      while ((match = rowRegex.exec(tableHtml)) !== null) {
+        const rowClasses = match[1];
+        const rowContent = match[2];
+
+        if (rowClasses.includes('mlsAttr')) {
+          const subtextMatch = rowContent.match(/<div class="subtext">([\s\S]*?)<\/div>/i);
+          if (subtextMatch) {
+            currentSource = subtextMatch[1].replace(/<[^>]+>/g, '').trim() || null;
+          }
+        } else if (!rowClasses.includes('BasicTable__headerRow')) {
+          const dateMatch = rowContent.match(/<div class="BasicTable__col date">([\s\S]*?)<\/div>/i);
+          const eventMatch = rowContent.match(/<div class="BasicTable__col event">([\s\S]*?)<\/div>/i);
+          const priceMatch = rowContent.match(/<div class="BasicTable__col price">([\s\S]*?)<\/div>/i);
+
+          if (dateMatch && eventMatch) {
+            const date = dateMatch[1].replace(/<[^>]+>/g, '').trim();
+            const eventText = eventMatch[1].replace(/<[^>]+>/g, '').trim();
+
+            let price: number | null = null;
+            if (priceMatch) {
+              let priceCell = priceMatch[1].replace(/<p class="subtext">[\s\S]*?<\/p>/gi, '');
+              priceCell = priceCell.replace(/<[^>]+>/g, '').trim();
+              const digits = priceCell.replace(/[^0-9]/g, '');
+              if (digits.length > 0) {
+                price = parseInt(digits, 10);
+              }
+            }
+
+            if (date && eventText) {
+              saleHistory.push({
+                date,
+                event: eventText,
+                price,
+                source: currentSource
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // 3. List Price (price on the most recent row whose event is "Listed")
+    const listedEntry = saleHistory.find(e => e.event.toLowerCase() === 'listed' && e.price !== null);
+    if (listedEntry) {
+      listPrice = listedEntry.price;
+    }
+  } catch (err) {
+    console.warn('[Scraper] Failed to extract Redfin metadata:', (err as Error).message);
+  }
+
+  return {
+    daysOnMarket,
+    listPrice,
+    saleHistory
+  };
+}
+
+async function scrapeWithBrightData(url: string): Promise<ScrapeResult> {
   if (!BRIGHTDATA_API_KEY) {
     throw new Error('BRIGHTDATA_API_KEY is not defined');
   }
@@ -434,10 +539,14 @@ async function scrapeWithBrightData(url: string): Promise<string[]> {
   }
 
   console.log(`[Scraper] Bright Data Web Unlocker successful. Extracted ${photos.length} photos.`);
-  return photos;
+  const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
+  return {
+    photos,
+    ...metadata
+  };
 }
 
-async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>): Promise<string[]> {
+async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>): Promise<ScrapeResult> {
   const target = getUrlTarget(url);
 
   // Route Zillow, Realtor, and Homes.com through Bright Data Web Unlocker if configured
@@ -477,7 +586,11 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
         await requestContext.dispose();
         if (photos.length > 0) {
           console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET successful. Extracted ${photos.length} photos.`);
-          return photos;
+          const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
+          return {
+            photos,
+            ...metadata
+          };
         }
       }
     } else {
@@ -516,7 +629,11 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
 
           if (photos.length > 0) {
             console.log(`[Scraper] Attempt ${attempt}: Browser-context HTTP GET successful. Extracted ${photos.length} photos.`);
-            return photos;
+            const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
+            return {
+              photos,
+              ...metadata
+            };
           }
         } else if (status === 403 || status === 429 || status === 503) {
           throw new TargetBlockedError(status, `Target page returned HTTP status ${status}`);
@@ -602,7 +719,11 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
       }
 
       console.log(`[Scraper] Attempt ${attempt}: Successfully extracted ${cleaned.length} photos.`);
-      return cleaned;
+      const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
+      return {
+        photos: cleaned,
+        ...metadata
+      };
     } finally {
       console.log(`[Scraper] Attempt ${attempt}: Closing Camoufox browser.`);
       await browser.close();
@@ -631,7 +752,7 @@ function isBlockOrTimeoutError(error: any): boolean {
   );
 }
 
-async function scrapePhotos(url: string): Promise<string[]> {
+async function scrapePhotos(url: string): Promise<ScrapeResult> {
   const target = getUrlTarget(url);
   const circuit = checkCircuit(target);
 
@@ -649,10 +770,10 @@ async function scrapePhotos(url: string): Promise<string[]> {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const options = getLaunchOptionsForAttempt(attempt);
     try {
-      const photos = await scrapePhotosAttempt(url, attempt, options);
+      const result = await scrapePhotosAttempt(url, attempt, options);
       recordScrapeResult(url, true, false);
       updateCircuitOnSuccess(target);
-      return photos;
+      return result;
     } catch (error) {
       if (isBlockOrTimeoutError(error)) {
         console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked or timed out: ${(error as Error).message}`);
@@ -692,8 +813,8 @@ app.post('/scrape', async (req: Request, res: Response) => {
   }
 
   try {
-    const photos = await scrapePhotos(url);
-    res.json({ photos });
+    const result = await scrapePhotos(url);
+    res.json(result);
   } catch (error) {
     console.error(`[Scraper] Scrape failed for ${url}:`, error);
 
