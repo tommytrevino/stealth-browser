@@ -219,9 +219,23 @@ class Semaphore {
   }
 }
 
-// Guarantee maximum 3 browser instances at once, and cap Redfin concurrency at 2
+// Guarantee maximum 3 browser instances at once, and cap Redfin concurrency at 1 with pacing
 const browserSemaphore = new Semaphore(3);
-const redfinSemaphore = new Semaphore(2);
+const redfinSemaphore = new Semaphore(1);
+
+let lastRedfinLaunchTime = 0;
+const REDFIN_MIN_LAUNCH_INTERVAL_MS = 2500; // 2.5s launch interval pacing
+
+async function paceRedfinRequest(): Promise<void> {
+  const now = Date.now();
+  const elapsed = now - lastRedfinLaunchTime;
+  if (elapsed < REDFIN_MIN_LAUNCH_INTERVAL_MS) {
+    const delay = REDFIN_MIN_LAUNCH_INTERVAL_MS - elapsed;
+    console.log(`[Scraper] Pacing Redfin request: waiting ${delay}ms to maintain ${REDFIN_MIN_LAUNCH_INTERVAL_MS / 1000}s launch interval...`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  lastRedfinLaunchTime = Date.now();
+}
 
 function findPhotosDeep(obj: any): any[] {
   if (!obj || typeof obj !== 'object') return [];
@@ -386,7 +400,7 @@ function getLaunchOptionsForAttempt(attempt: number): Record<string, any> {
     if (options.proxy.server.includes('webshare')) {
       options.proxy.username = cleanUsername;
     } else {
-      const randomId = Math.random().toString(36).substring(2, 10);
+      const randomId = `${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
       options.proxy.username = `${cleanUsername}-session-${randomId}`;
       console.log(`[Scraper] Attempt ${attempt}: Rotating proxy session username to ${options.proxy.username}`);
     }
@@ -555,13 +569,13 @@ async function scrapeWithBrightData(url: string): Promise<ScrapeResult> {
 async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>): Promise<ScrapeResult> {
   const target = getUrlTarget(url);
 
-  // Route Zillow, Realtor, and Homes.com through Bright Data Web Unlocker if configured
-  if ((target === 'zillow' || target === 'realtor' || target === 'homes') && BRIGHTDATA_API_KEY) {
+  // Route Zillow, Realtor, Homes.com, and Redfin through Bright Data Web Unlocker if configured
+  if ((target === 'zillow' || target === 'realtor' || target === 'homes' || target === 'redfin') && BRIGHTDATA_API_KEY) {
     try {
       return await scrapeWithBrightData(url);
     } catch (error) {
-      console.warn(`[Scraper] Bright Data Web Unlocker failed for ${url}: ${(error as Error).message}. No local browser fallback allowed.`);
-      throw error;
+      console.warn(`[Scraper] Bright Data Web Unlocker failed for ${url}: ${(error as Error).message}.`);
+      if (error instanceof TargetBlockedError) throw error;
     }
   }
 
@@ -571,9 +585,14 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
     const requestContext = await request.newContext({
       proxy: options.proxy,
       extraHTTPHeaders: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1'
       }
     });
 
@@ -781,7 +800,7 @@ async function executeScrapeWithRetries(url: string, target: string, startTime: 
   }
 
   // Redfin allowed 1 retry (max 2 attempts); BrightData allowed 1 attempt; others 3 attempts
-  const isBrightData = (target === 'zillow' || target === 'realtor' || target === 'homes') && BRIGHTDATA_API_KEY;
+  const isBrightData = (target === 'zillow' || target === 'realtor' || target === 'homes' || target === 'redfin') && BRIGHTDATA_API_KEY;
   const maxAttempts = (circuit === 'half-open' || isBrightData) ? 1 : (target === 'redfin' ? 2 : 3);
   let lastError: Error | null = null;
 
@@ -826,6 +845,7 @@ async function scrapePhotos(url: string): Promise<ScrapeResult> {
 
   if (target === 'redfin') {
     await redfinSemaphore.acquire();
+    await paceRedfinRequest();
   }
 
   try {
