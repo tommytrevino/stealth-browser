@@ -219,8 +219,9 @@ class Semaphore {
   }
 }
 
-// Guarantee maximum 3 browser instances at once to stay safe on resource usage
+// Guarantee maximum 3 browser instances at once, and cap Redfin concurrency at 2
 const browserSemaphore = new Semaphore(3);
+const redfinSemaphore = new Semaphore(2);
 
 function findPhotosDeep(obj: any): any[] {
   if (!obj || typeof obj !== 'object') return [];
@@ -363,8 +364,13 @@ function isCaptchaOrBlockPage(html: string): boolean {
     lowercase.includes('h-captcha') ||
     lowercase.includes('sec-cpt') ||
     lowercase.includes('captcha-container') ||
-    (lowercase.includes('access denied') && lowercase.includes('reference #')) ||
-    lowercase.includes('unusual traffic from your computer network')
+    lowercase.includes('pardon our interruption') ||
+    lowercase.includes('robot or human') ||
+    lowercase.includes('verify you are human') ||
+    lowercase.includes('access denied') ||
+    lowercase.includes('unusual traffic') ||
+    lowercase.includes('405 method not allowed') ||
+    lowercase.includes('405 forbidden')
   );
 }
 
@@ -387,6 +393,7 @@ function getLaunchOptionsForAttempt(attempt: number): Record<string, any> {
   }
   return options;
 }
+
 export interface SaleHistoryEntry {
   date: string;
   event: string;
@@ -498,7 +505,6 @@ async function scrapeWithBrightData(url: string): Promise<ScrapeResult> {
   }
 
   const target = getUrlTarget(url);
-  // Zillow/Redfin/Homes/other get 25s (slow responses correlate with thin/empty results). Realtor gets 20s.
   const timeoutMs = target === 'realtor' ? 20000 : 25000;
 
   console.log(`[Scraper] Querying Bright Data Web Unlocker for URL: ${url} (Timeout: ${timeoutMs / 1000}s)`);
@@ -521,7 +527,7 @@ async function scrapeWithBrightData(url: string): Promise<ScrapeResult> {
     const errorText = await response.text();
     console.error(`[Scraper] Bright Data API returned status ${response.status}: ${errorText}`);
     
-    if (response.status === 403 || response.status === 429 || response.status === 503) {
+    if (response.status === 403 || response.status === 405 || response.status === 429 || response.status === 503) {
       throw new TargetBlockedError(response.status, `Target page returned HTTP status ${response.status}`);
     }
     throw new Error(`Bright Data API request failed with status ${response.status}`);
@@ -535,7 +541,7 @@ async function scrapeWithBrightData(url: string): Promise<ScrapeResult> {
 
   const photos = extractPhotosFromHtml(html);
   if (photos.length === 0) {
-    throw new Error('No photos extracted from listing page (likely empty or unrecognized layout)');
+    throw new TargetBlockedError(429, 'Target page returned block page or no content');
   }
 
   console.log(`[Scraper] Bright Data Web Unlocker successful. Extracted ${photos.length} photos.`);
@@ -559,7 +565,7 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
     }
   }
 
-  // Layer 1: Try standalone HTTP GET request first (requires 0 browser process launch overhead!)
+  // Layer 1: Try standalone HTTP GET request first
   try {
     console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET for URL: ${url}`);
     const requestContext = await request.newContext({
@@ -571,9 +577,14 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
       }
     });
 
-    const response = await requestContext.get(url, { timeout: 8000 });
+    const response = await requestContext.get(url, { timeout: 6000 });
     const status = response.status();
     console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET response status: ${status}`);
+
+    if (status === 405 || status === 403 || status === 429 || status === 503) {
+      await requestContext.dispose();
+      throw new TargetBlockedError(status, `Target page returned HTTP status ${status}`);
+    }
 
     if (status === 200) {
       const html = await response.text();
@@ -597,10 +608,11 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
       await requestContext.dispose();
     }
   } catch (err) {
+    if (err instanceof TargetBlockedError) throw err;
     console.warn(`[Scraper] Attempt ${attempt}: Standalone HTTP GET failed: ${(err as Error).message}`);
   }
 
-  // Layer 2: Launch browser & try browser-context request (inherits Camoufox TLS signatures)
+  // Layer 2: Launch browser & try browser-context request
   console.log(`[Scraper] Attempt ${attempt}: Entering browser queue for URL: ${url}`);
   await browserSemaphore.acquire();
 
@@ -613,14 +625,20 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
         console.log(`[Scraper] Attempt ${attempt}: Attempting browser-context HTTP GET...`);
         const context = await browser.newContext();
         
-        const response = await context.request.get(url, { timeout: 10000 });
+        const response = await context.request.get(url, { timeout: 8000 });
         const status = response.status();
         console.log(`[Scraper] Attempt ${attempt}: Browser-context HTTP GET response status: ${status}`);
+
+        if (status === 405 || status === 403 || status === 429 || status === 503) {
+          await context.close();
+          throw new TargetBlockedError(status, `Target page returned HTTP status ${status}`);
+        }
 
         if (status === 200) {
           const html = await response.text();
           
           if (isCaptchaOrBlockPage(html)) {
+            await context.close();
             throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
           }
 
@@ -635,8 +653,6 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
               ...metadata
             };
           }
-        } else if (status === 403 || status === 429 || status === 503) {
-          throw new TargetBlockedError(status, `Target page returned HTTP status ${status}`);
         } else {
           await context.close();
         }
@@ -659,12 +675,12 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
         }
       });
 
-      // Navigate to listing page (with 15s timeout)
+      // Navigate to listing page (with 12s timeout)
       console.log(`[Scraper] Attempt ${attempt}: Navigating to page...`);
-      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
       const status = response?.status() ?? 0;
-      if (status >= 400) {
-        throw new TargetBlockedError(status, `Target page returned HTTP status ${status}`);
+      if (status === 405 || status === 403 || status === 429 || status === 503 || status >= 400) {
+        throw new TargetBlockedError(status >= 400 ? status : 429, `Target page returned HTTP status ${status}`);
       }
 
       const html = await page.content();
@@ -672,26 +688,26 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
         throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
       }
 
-      // Wait a brief moment to ensure dynamic images begin loading
-      await page.waitForTimeout(1000);
+      // Wait safely for navigation/rendering to settle
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await page.waitForTimeout(500);
 
       console.log(`[Scraper] Attempt ${attempt}: Extracting page content...`);
-      const result = await page.evaluate(() => {
-        // 1. Gather all raw script text contents (includes JSON-LD, __NEXT_DATA__, Redfin state, etc.)
-        const scriptTexts = Array.from(document.querySelectorAll('script'))
-          .map((s) => s.textContent || '');
-
-        // 2. Gather standard image elements
-        const imgs = Array.from(document.images).map((img: HTMLImageElement) => img.src);
-
-        return { scriptTexts, imgs };
-      });
+      let result: { scriptTexts: string[]; imgs: string[] } | null = null;
+      try {
+        result = await page.evaluate(() => {
+          const scriptTexts = Array.from(document.querySelectorAll('script'))
+            .map((s) => s.textContent || '');
+          const imgs = Array.from(document.images).map((img: HTMLImageElement) => img.src);
+          return { scriptTexts, imgs };
+        });
+      } catch (evalErr) {
+        console.warn(`[Scraper] Attempt ${attempt}: page.evaluate failed (${(evalErr as Error).message}). Extracting directly from html string.`);
+      }
 
       const photos: string[] = [];
 
       if (result) {
-        // 1. Search text contents of all script tags using regex patterns for CDN URLs
-        // Normalize escaped slashes (\/) in JSON strings to standard slashes (/) first
         const fullText = result.scriptTexts.join('\n').replace(/\\\//g, '/');
         
         const redfinMatches = fullText.match(/https:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'>\\,;`]+/g) || [];
@@ -700,7 +716,6 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
 
         photos.push(...redfinMatches, ...zillowMatches, ...realtorMatches);
 
-        // 2. Search standard image elements
         result.imgs.forEach((src: string) => {
           if (!src) return;
           if (src.includes('ssl.cdn-redfin.com') || src.includes('photos.zillowstatic.com') || src.includes('rdcpix.com')) {
@@ -709,13 +724,17 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
         });
       }
 
+      // Fallback: also run extractPhotosFromHtml on raw html string
+      const htmlPhotos = extractPhotosFromHtml(html);
+      photos.push(...htmlPhotos);
+
       // Clean, de-duplicate, and filter out tracking pixels
       const cleaned = Array.from(new Set(photos)).filter(
         p => !p.includes('pixel') && !p.includes('tracking')
       );
 
       if (cleaned.length === 0) {
-        throw new Error('No photos extracted from listing page (likely empty or unrecognized layout)');
+        throw new TargetBlockedError(429, 'Target page returned block page or no content');
       }
 
       console.log(`[Scraper] Attempt ${attempt}: Successfully extracted ${cleaned.length} photos.`);
@@ -752,8 +771,7 @@ function isBlockOrTimeoutError(error: any): boolean {
   );
 }
 
-async function scrapePhotos(url: string): Promise<ScrapeResult> {
-  const target = getUrlTarget(url);
+async function executeScrapeWithRetries(url: string, target: string, startTime: number): Promise<ScrapeResult> {
   const circuit = checkCircuit(target);
 
   if (circuit === 'open') {
@@ -762,12 +780,16 @@ async function scrapePhotos(url: string): Promise<ScrapeResult> {
     throw new TargetBlockedError(429, `Target page returned HTTP status 429 [Circuit is OPEN]`);
   }
 
-  // If circuit is half-open, or we are routing through Bright Data (which handles retries internally), run only 1 attempt.
+  // Redfin allowed 1 retry (max 2 attempts); BrightData allowed 1 attempt; others 3 attempts
   const isBrightData = (target === 'zillow' || target === 'realtor' || target === 'homes') && BRIGHTDATA_API_KEY;
-  const maxAttempts = (circuit === 'half-open' || isBrightData) ? 1 : 3;
+  const maxAttempts = (circuit === 'half-open' || isBrightData) ? 1 : (target === 'redfin' ? 2 : 3);
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (Date.now() - startTime > 18000) {
+      throw new TargetBlockedError(429, 'Request timed out waiting for target (20s ceiling exceeded)');
+    }
+
     const options = getLaunchOptionsForAttempt(attempt);
     try {
       const result = await scrapePhotosAttempt(url, attempt, options);
@@ -776,24 +798,60 @@ async function scrapePhotos(url: string): Promise<ScrapeResult> {
       return result;
     } catch (error) {
       if (isBlockOrTimeoutError(error)) {
-        console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked or timed out: ${(error as Error).message}`);
+        console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked or timed out for ${target}: ${(error as Error).message}`);
         recordScrapeResult(url, false, true);
         lastError = error instanceof TargetBlockedError ? error : new TargetBlockedError(408, (error as Error).message);
-        // Wait a brief moment before retrying (exponential backoff)
+        
         if (attempt < maxAttempts) {
-          await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+          const backoffMs = target === 'redfin'
+            ? Math.floor(2000 + Math.random() * 2000)
+            : attempt * 500;
+          console.log(`[Scraper] Retrying ${url} in ${backoffMs}ms (attempt ${attempt + 1}/${maxAttempts})...`);
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
         }
       } else {
-        // Fatal browser or initialization error — throw immediately
         recordScrapeResult(url, false, true);
         throw error;
       }
     }
   }
 
-  // If we reach here, all attempts were blocked by target page
   updateCircuitOnBlock(target);
-  throw lastError || new Error('Scraping failed after max retries');
+  throw lastError || new TargetBlockedError(429, 'Target page returned block page or no content after retries');
+}
+
+async function scrapePhotos(url: string): Promise<ScrapeResult> {
+  const target = getUrlTarget(url);
+  const startTime = Date.now();
+
+  if (target === 'redfin') {
+    await redfinSemaphore.acquire();
+  }
+
+  try {
+    return await executeScrapeWithRetries(url, target, startTime);
+  } finally {
+    if (target === 'redfin') {
+      redfinSemaphore.release();
+    }
+  }
+}
+
+async function scrapePhotosWithTimeout(url: string): Promise<ScrapeResult> {
+  const REQUEST_TIMEOUT_MS = 20000;
+  let timerId: NodeJS.Timeout;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timerId = setTimeout(() => {
+      reject(new TargetBlockedError(429, 'Request timed out waiting for target (20s ceiling exceeded)'));
+    }, REQUEST_TIMEOUT_MS);
+  });
+
+  try {
+    return await Promise.race([scrapePhotos(url), timeoutPromise]);
+  } finally {
+    clearTimeout(timerId!);
+  }
 }
 
 // Scrape API endpoint
@@ -813,7 +871,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
   }
 
   try {
-    const result = await scrapePhotos(url);
+    const result = await scrapePhotosWithTimeout(url);
     res.json(result);
   } catch (error) {
     console.error(`[Scraper] Scrape failed for ${url}:`, error);
