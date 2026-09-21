@@ -51,6 +51,13 @@ class TargetBlockedError extends Error {
   }
 }
 
+class CircuitOpenError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = 'CircuitOpenError';
+  }
+}
+
 interface ScrapeRecord {
   timestamp: number;
   target: string;
@@ -83,8 +90,20 @@ const targetStates: Record<string, TargetState> = {
   other: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
 };
 
-const CIRCUIT_OPEN_DURATION_MS = 5 * 60 * 1000; // 5 minutes in Open state before testing Half-Open
-const BLOCK_THRESHOLD = 5; // 5 consecutive blocks opens the circuit
+const CIRCUIT_OPEN_DURATION_MS = 45 * 1000; // 45 seconds in Open state before testing Half-Open
+const BLOCK_THRESHOLD = 5; // 5 consecutive real target blocks opens the circuit
+
+function isTargetBlockResponse(error: any): boolean {
+  if (error instanceof TargetBlockedError) {
+    const msg = error.message.toLowerCase();
+    // Exclude self-inflicted timeouts or queue wait errors from circuit breaker block count
+    if (msg.includes('ceiling') || msg.includes('queue') || msg.includes('timed out')) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
 
 function getUrlTarget(url: string): string {
   const lowercase = url.toLowerCase();
@@ -109,7 +128,7 @@ function updateCircuitOnBlock(target: string) {
   const state = targetStates[target];
   state.consecutiveBlocks++;
   if (state.circuit === 'closed' && state.consecutiveBlocks >= BLOCK_THRESHOLD) {
-    console.warn(`[Circuit Breaker] ${target} hit ${state.consecutiveBlocks} consecutive blocks. Opening circuit.`);
+    console.warn(`[Circuit Breaker] ${target} hit ${state.consecutiveBlocks} consecutive real blocks. Opening circuit.`);
     state.circuit = 'open';
     state.lastStateChange = Date.now();
   } else if (state.circuit === 'half-open') {
@@ -224,7 +243,7 @@ const browserSemaphore = new Semaphore(3);
 const redfinSemaphore = new Semaphore(1);
 
 let lastRedfinLaunchTime = 0;
-const REDFIN_MIN_LAUNCH_INTERVAL_MS = 2500; // 2.5s launch interval pacing
+const REDFIN_MIN_LAUNCH_INTERVAL_MS = 2500; // 2.5s launch interval pacing for Redfin only
 
 async function paceRedfinRequest(): Promise<void> {
   const now = Date.now();
@@ -790,23 +809,25 @@ function isBlockOrTimeoutError(error: any): boolean {
   );
 }
 
-async function executeScrapeWithRetries(url: string, target: string, startTime: number): Promise<ScrapeResult> {
+async function executeScrapeWithRetries(url: string, target: string): Promise<ScrapeResult> {
   const circuit = checkCircuit(target);
 
   if (circuit === 'open') {
     console.log(`[Circuit Breaker] Skipping request for ${url} (Circuit is OPEN).`);
     recordScrapeResult(url, false, true);
-    throw new TargetBlockedError(429, `Target page returned HTTP status 429 [Circuit is OPEN]`);
+    throw new CircuitOpenError(429, `Target page returned HTTP status 429 [Circuit is OPEN]`);
   }
 
   // Redfin allowed 1 retry (max 2 attempts); BrightData allowed 1 attempt; others 3 attempts
   const isBrightData = (target === 'zillow' || target === 'realtor' || target === 'homes' || target === 'redfin') && BRIGHTDATA_API_KEY;
   const maxAttempts = (circuit === 'half-open' || isBrightData) ? 1 : (target === 'redfin' ? 2 : 3);
   let lastError: Error | null = null;
+  let hasRealBlock = false;
+  const renderStartTime = Date.now();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (Date.now() - startTime > 18000) {
-      throw new TargetBlockedError(429, 'Request timed out waiting for target (20s ceiling exceeded)');
+    if (Date.now() - renderStartTime > 20000) {
+      throw new TargetBlockedError(429, 'Request timed out rendering target (20s ceiling exceeded)');
     }
 
     const options = getLaunchOptionsForAttempt(attempt);
@@ -818,7 +839,10 @@ async function executeScrapeWithRetries(url: string, target: string, startTime: 
     } catch (error) {
       if (isBlockOrTimeoutError(error)) {
         console.warn(`[Scraper] Attempt ${attempt}/${maxAttempts} blocked or timed out for ${target}: ${(error as Error).message}`);
-        recordScrapeResult(url, false, true);
+        const isRealBlock = isTargetBlockResponse(error);
+        if (isRealBlock) hasRealBlock = true;
+
+        recordScrapeResult(url, false, isRealBlock);
         lastError = error instanceof TargetBlockedError ? error : new TargetBlockedError(408, (error as Error).message);
         
         if (attempt < maxAttempts) {
@@ -829,13 +853,15 @@ async function executeScrapeWithRetries(url: string, target: string, startTime: 
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
         }
       } else {
-        recordScrapeResult(url, false, true);
+        recordScrapeResult(url, false, false);
         throw error;
       }
     }
   }
 
-  updateCircuitOnBlock(target);
+  if (hasRealBlock) {
+    updateCircuitOnBlock(target);
+  }
   throw lastError || new TargetBlockedError(429, 'Target page returned block page or no content after retries');
 }
 
@@ -849,7 +875,7 @@ async function scrapePhotos(url: string): Promise<ScrapeResult> {
   }
 
   try {
-    return await executeScrapeWithRetries(url, target, startTime);
+    return await executeScrapeWithRetries(url, target);
   } finally {
     if (target === 'redfin') {
       redfinSemaphore.release();
@@ -858,13 +884,13 @@ async function scrapePhotos(url: string): Promise<ScrapeResult> {
 }
 
 async function scrapePhotosWithTimeout(url: string): Promise<ScrapeResult> {
-  const REQUEST_TIMEOUT_MS = 20000;
+  const QUEUE_WAIT_TIMEOUT_MS = 90000; // 90s budget for queue wait + pacing
   let timerId: NodeJS.Timeout;
 
   const timeoutPromise = new Promise<never>((_, reject) => {
     timerId = setTimeout(() => {
-      reject(new TargetBlockedError(429, 'Request timed out waiting for target (20s ceiling exceeded)'));
-    }, REQUEST_TIMEOUT_MS);
+      reject(new TargetBlockedError(429, 'Request timed out waiting in queue (90s budget exceeded)'));
+    }, QUEUE_WAIT_TIMEOUT_MS);
   });
 
   try {
@@ -896,7 +922,14 @@ app.post('/scrape', async (req: Request, res: Response) => {
   } catch (error) {
     console.error(`[Scraper] Scrape failed for ${url}:`, error);
 
-    if (error instanceof TargetBlockedError) {
+    if (error instanceof CircuitOpenError) {
+      res.statusMessage = error.message;
+      res.status(429).json({
+        error: error.message,
+        reason: 'circuit_open',
+        status: 429
+      });
+    } else if (error instanceof TargetBlockedError) {
       res.statusMessage = error.message;
       res.status(error.status).json({
         error: error.message,
