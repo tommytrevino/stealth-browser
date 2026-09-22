@@ -238,12 +238,12 @@ class Semaphore {
   }
 }
 
-// Guarantee maximum 3 browser instances at once, and cap Redfin concurrency at 1 with pacing
+// Guarantee maximum 3 browser instances at once, and allow 2 concurrent Redfin requests with light pacing
 const browserSemaphore = new Semaphore(3);
-const redfinSemaphore = new Semaphore(1);
+const redfinSemaphore = new Semaphore(2);
 
 let lastRedfinLaunchTime = 0;
-const REDFIN_MIN_LAUNCH_INTERVAL_MS = 2500; // 2.5s launch interval pacing for Redfin only
+const REDFIN_MIN_LAUNCH_INTERVAL_MS = 1000; // 1.0s launch interval pacing for Redfin
 
 async function paceRedfinRequest(): Promise<void> {
   const now = Date.now();
@@ -411,18 +411,22 @@ function getLaunchOptionsForAttempt(attempt: number): Record<string, any> {
   const options = JSON.parse(JSON.stringify(LAUNCH_OPTIONS));
   if (options.proxy && options.proxy.username) {
     const baseUsername = options.proxy.username;
-    // Strip any existing session/id suffixes to prevent build-up
-    const cleanUsername = baseUsername.replace(/-session-[\w]+/g, '').replace(/-id-[\w]+/g, '');
+    // Strip any existing session/id/zone suffixes to get the clean base username
+    const cleanUsername = baseUsername.replace(/(-session-|-id-|-zone-|-sessionid-).*/i, '');
     
-    // Webshare does NOT support username session suffixes (it breaks auth).
-    // Only apply session randomizers for providers like Bright Data, Oxylabs, Smartproxy, etc.
-    if (options.proxy.server.includes('webshare')) {
+    // Generate a unique session ID per request attempt for residential/datacenter proxy IP rotation
+    const randomId = `${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
+    if (options.proxy.server.includes('smartproxy') || options.proxy.server.includes('gate.')) {
+      options.proxy.username = `${cleanUsername}-session-${randomId}`;
+    } else if (options.proxy.server.includes('brightdata') || options.proxy.server.includes('luminati')) {
+      options.proxy.username = `${cleanUsername}-session-${randomId}`;
+    } else if (options.proxy.server.includes('webshare')) {
+      // For Webshare rotating proxy endpoints or standard proxy credentials
       options.proxy.username = cleanUsername;
     } else {
-      const randomId = `${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
       options.proxy.username = `${cleanUsername}-session-${randomId}`;
-      console.log(`[Scraper] Attempt ${attempt}: Rotating proxy session username to ${options.proxy.username}`);
     }
+    console.log(`[Scraper] Attempt ${attempt}: Using proxy session username ${options.proxy.username}`);
   }
   return options;
 }
@@ -452,17 +456,27 @@ function extractRedfinMetadata(html: string): {
 
   try {
     // 1. Days On Market
-    const domMatch1 = html.match(/Days\s+On\s+Market:\s*(\d+)/i);
-    if (domMatch1) {
-      daysOnMarket = parseInt(domMatch1[1], 10);
-    } else {
-      const domMatch2 = html.match(/"amenityName":"Days On Market".*?"amenityValues":\["(\d+)"\]/i);
-      if (domMatch2) {
-        daysOnMarket = parseInt(domMatch2[1], 10);
-      } else {
-        const domMatch3 = html.match(/<li[^>]*>\s*Days On Market\s*:\s*(\d+)\s*<\/li>/i);
-        if (domMatch3) {
-          daysOnMarket = parseInt(domMatch3[1], 10);
+    const domRegexes = [
+      /"daysOnMarket"\s*:\s*(\d+)/i,
+      /"timeOnRedfin"\s*:\s*\{\s*"value"\s*:\s*(\d+)/i,
+      /"timeOnMarket"\s*:\s*(\d+)/i,
+      /Days\s+On\s+Market:\s*(\d+)/i,
+      /Days\s+on\s+Redfin:\s*(\d+)/i,
+      /"amenityName"\s*:\s*"Days\s+On\s+Market".*?"amenityValues"\s*:\s*\["(\d+)"\]/i,
+      /"label"\s*:\s*"Days\s+on\s+Redfin".*?"value"\s*:\s*"(\d+)/i,
+      />\s*(\d+)\s*<\/span>\s*<span[^>]*>\s*Days\s+on\s+(?:Market|Redfin)\s*<\/span>/i,
+      /<span[^>]*>\s*Days\s+on\s+(?:Market|Redfin)\s*<\/span>\s*<span[^>]*>\s*(\d+)\s*<\/span>/i,
+      /(\d+)\s+days?\s+on\s+(?:Redfin|market)/i,
+      /<li[^>]*>\s*Days On Market\s*:\s*(\d+)\s*<\/li>/i,
+    ];
+
+    for (const rx of domRegexes) {
+      const match = html.match(rx);
+      if (match && match[1]) {
+        const val = parseInt(match[1], 10);
+        if (!isNaN(val)) {
+          daysOnMarket = val;
+          break;
         }
       }
     }
@@ -520,6 +534,16 @@ function extractRedfinMetadata(html: string): {
     const listedEntry = saleHistory.find(e => e.event.toLowerCase() === 'listed' && e.price !== null);
     if (listedEntry) {
       listPrice = listedEntry.price;
+    } else {
+      const priceMatch1 = html.match(/data-rf-test-name="stat-price"[^>]*>[\s\S]*?\$([\d,]+)/i);
+      if (priceMatch1) {
+        listPrice = parseInt(priceMatch1[1].replace(/,/g, ''), 10);
+      } else {
+        const priceMatch2 = html.match(/"price"\s*:\s*(\d+)/i);
+        if (priceMatch2) {
+          listPrice = parseInt(priceMatch2[1], 10);
+        }
+      }
     }
   } catch (err) {
     console.warn('[Scraper] Failed to extract Redfin metadata:', (err as Error).message);
@@ -663,7 +687,7 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
         console.log(`[Scraper] Attempt ${attempt}: Attempting browser-context HTTP GET...`);
         const context = await browser.newContext();
         
-        const response = await context.request.get(url, { timeout: 8000 });
+        const response = await context.request.get(url, { timeout: 4000 });
         const status = response.status();
         console.log(`[Scraper] Attempt ${attempt}: Browser-context HTTP GET response status: ${status}`);
 
@@ -713,9 +737,9 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
         }
       });
 
-      // Navigate to listing page (with 12s timeout)
+      // Navigate to listing page (with 7s timeout)
       console.log(`[Scraper] Attempt ${attempt}: Navigating to page...`);
-      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 7000 });
       const status = response?.status() ?? 0;
       if (status === 405 || status === 403 || status === 429 || status === 503 || status >= 400) {
         throw new TargetBlockedError(status >= 400 ? status : 429, `Target page returned HTTP status ${status}`);
