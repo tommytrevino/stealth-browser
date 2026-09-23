@@ -58,6 +58,13 @@ class CircuitOpenError extends Error {
   }
 }
 
+class FetchTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FetchTimeoutError';
+  }
+}
+
 interface ScrapeRecord {
   timestamp: number;
   target: string;
@@ -403,7 +410,8 @@ function isCaptchaOrBlockPage(html: string): boolean {
     lowercase.includes('access denied') ||
     lowercase.includes('unusual traffic') ||
     lowercase.includes('405 method not allowed') ||
-    lowercase.includes('405 forbidden')
+    lowercase.includes('405 forbidden') ||
+    lowercase.includes('request blocked')
   );
 }
 
@@ -959,6 +967,201 @@ app.post('/scrape', async (req: Request, res: Response) => {
         error: error.message,
         reason: 'target_blocked',
         status: error.status
+      });
+    } else {
+      res.status(500).json({
+        error: (error as Error).message,
+        reason: 'resolver_error'
+      });
+    }
+  }
+});
+
+function isAllowedFetchUrl(urlStr: string): boolean {
+  try {
+    const parsed = new URL(urlStr);
+    if (parsed.protocol !== 'https:') return false;
+    if (parsed.hostname !== 'www.redfin.com') return false;
+    const path = parsed.pathname;
+    return path === '/stingray/api/gis' || path === '/stingray/do/location-autocomplete';
+  } catch {
+    return false;
+  }
+}
+
+interface FetchResult {
+  status: number;
+  body: string;
+}
+
+let cachedRedfinCookies: Map<string, string> = new Map();
+
+function updateRedfinCookies(setCookieHeader?: string) {
+  if (!setCookieHeader) return;
+  const lines = setCookieHeader.split(/\r?\n|, (?=[a-zA-Z0-9_-]+=)/);
+  for (const line of lines) {
+    const parts = line.split(';')[0]?.trim();
+    if (parts && parts.includes('=')) {
+      const [name, ...val] = parts.split('=');
+      if (name && val) {
+        cachedRedfinCookies.set(name.trim(), val.join('=').trim());
+      }
+    }
+  }
+}
+
+function getRedfinCookieHeader(): string | undefined {
+  if (cachedRedfinCookies.size === 0) return undefined;
+  return Array.from(cachedRedfinCookies.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
+
+async function executeFetchRequest(url: string): Promise<FetchResult> {
+  const options = getLaunchOptionsForAttempt(1);
+  const FETCH_TIMEOUT_MS = 15000; // 15s budget for the request itself
+
+  console.log(`[Fetcher] Executing proxied fetch for URL: ${url}`);
+  let requestContext;
+  try {
+    const cookieHeader = getRedfinCookieHeader();
+    const extraHeaders: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Sec-Ch-Ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"macOS"',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+      'Referer': 'https://www.redfin.com/'
+    };
+    if (cookieHeader) {
+      extraHeaders['Cookie'] = cookieHeader;
+    }
+
+    requestContext = await request.newContext({
+      proxy: options.proxy,
+      extraHTTPHeaders: extraHeaders
+    });
+
+    const response = await requestContext.get(url, { timeout: FETCH_TIMEOUT_MS });
+    const status = response.status();
+    const finalUrl = response.url();
+    const rawHeaders = response.headers();
+    if (rawHeaders['set-cookie']) {
+      updateRedfinCookies(rawHeaders['set-cookie']);
+    }
+
+    const text = await response.text();
+    await requestContext.dispose();
+
+    if (
+      status === 403 ||
+      status === 429 ||
+      status === 503 ||
+      finalUrl.includes('ratelimited.redfin.com') ||
+      isCaptchaOrBlockPage(text)
+    ) {
+      console.warn(`[Fetcher] Target blocked with status ${status}, url: ${finalUrl}`);
+      recordScrapeResult(url, false, true);
+      updateCircuitOnBlock('redfin');
+      throw new TargetBlockedError(429, `Target page returned HTTP status ${status}`);
+    }
+
+    recordScrapeResult(url, true, false);
+    updateCircuitOnSuccess('redfin');
+    return { status, body: text };
+  } catch (err: any) {
+    if (requestContext) {
+      await requestContext.dispose().catch(() => {});
+    }
+    if (err instanceof TargetBlockedError || err instanceof CircuitOpenError) {
+      throw err;
+    }
+    const msg = err?.message?.toLowerCase() || '';
+    if (err?.name === 'TimeoutError' || msg.includes('timeout') || msg.includes('timed out')) {
+      console.warn(`[Fetcher] Request timed out for URL: ${url}`);
+      throw new FetchTimeoutError('Request timed out');
+    }
+    throw err;
+  }
+}
+
+async function fetchRedfinWithQueue(url: string): Promise<FetchResult> {
+  const circuit = checkCircuit('redfin');
+  if (circuit === 'open') {
+    console.log(`[Circuit Breaker] Skipping fetch for ${url} (Circuit is OPEN).`);
+    recordScrapeResult(url, false, true);
+    throw new CircuitOpenError(429, `Target page returned HTTP status 429 [Circuit is OPEN]`);
+  }
+
+  const QUEUE_WAIT_TIMEOUT_MS = 90000;
+  let timerId: NodeJS.Timeout;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timerId = setTimeout(() => {
+      reject(new TargetBlockedError(429, 'Request timed out waiting in queue (90s budget exceeded)'));
+    }, QUEUE_WAIT_TIMEOUT_MS);
+  });
+
+  const worker = async () => {
+    await redfinSemaphore.acquire();
+    try {
+      await paceRedfinRequest();
+      return await executeFetchRequest(url);
+    } finally {
+      redfinSemaphore.release();
+    }
+  };
+
+  try {
+    return await Promise.race([worker(), timeoutPromise]);
+  } finally {
+    clearTimeout(timerId!);
+  }
+}
+
+// Proxied JSON fetch API endpoint for Redfin search data
+app.post('/fetch', async (req: Request, res: Response) => {
+  // Simple Authorization header check
+  if (ACCESS_KEY) {
+    const authHeader = req.headers.authorization;
+    if (authHeader !== `Bearer ${ACCESS_KEY}`) {
+      console.warn(`[Fetcher] Unauthorized access attempt blocked.`);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+
+  const { url } = req.body;
+  if (!url || typeof url !== 'string' || !isAllowedFetchUrl(url)) {
+    return res.status(400).json({ error: 'url not allowed', reason: 'not_allowed' });
+  }
+
+  try {
+    const result = await fetchRedfinWithQueue(url);
+    res.json(result);
+  } catch (error) {
+    console.error(`[Fetcher] Fetch failed for ${url}:`, error);
+
+    if (error instanceof CircuitOpenError) {
+      res.statusMessage = error.message;
+      res.status(429).json({
+        error: error.message,
+        reason: 'circuit_open',
+        status: 429
+      });
+    } else if (error instanceof TargetBlockedError) {
+      res.statusMessage = error.message;
+      res.status(error.status || 429).json({
+        error: error.message,
+        reason: 'target_blocked',
+        status: error.status || 429
+      });
+    } else if (error instanceof FetchTimeoutError) {
+      res.status(504).json({
+        reason: 'timeout'
       });
     } else {
       res.status(500).json({
