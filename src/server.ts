@@ -983,7 +983,9 @@ function isAllowedFetchUrl(urlStr: string): boolean {
     if (parsed.protocol !== 'https:') return false;
     if (parsed.hostname !== 'www.redfin.com') return false;
     const path = parsed.pathname;
-    return path === '/stingray/api/gis' || path === '/stingray/do/location-autocomplete';
+    if (path === '/stingray/api/gis' || path === '/stingray/do/location-autocomplete') return true;
+    if (/^\/zipcode\/\d{5}\/?$/.test(path)) return true;
+    return false;
   } catch {
     return false;
   }
@@ -991,10 +993,48 @@ function isAllowedFetchUrl(urlStr: string): boolean {
 
 interface FetchResult {
   status: number;
-  body: string;
+  body?: string;
+  data?: any;
 }
 
 let cachedRedfinCookies: Map<string, string> = new Map();
+let warmingPromise: Promise<void> | null = null;
+let lastCookieWarmTime = 0;
+const COOKIE_MAX_AGE_MS = 20 * 60 * 1000; // 20 minutes
+
+async function warmRedfinCookies(): Promise<void> {
+  if (warmingPromise) {
+    return warmingPromise;
+  }
+  warmingPromise = (async () => {
+    let browser;
+    try {
+      console.log('[Fetcher] Warming Redfin session and WAF tokens via Camoufox...');
+      const options = getLaunchOptionsForAttempt(1);
+      browser = await Camoufox(options);
+      const context = await browser.newContext();
+      const page = await context.newPage();
+      await page.goto('https://www.redfin.com', { waitUntil: 'networkidle' });
+      await page.waitForTimeout(2500);
+      const cookies = await context.cookies();
+      for (const cookie of cookies) {
+        if (cookie.domain.includes('redfin.com')) {
+          cachedRedfinCookies.set(cookie.name, cookie.value);
+        }
+      }
+      lastCookieWarmTime = Date.now();
+      console.log(`[Fetcher] Successfully warmed Redfin cookies (${cachedRedfinCookies.size} cookies cached, aws-waf-token: ${cachedRedfinCookies.has('aws-waf-token')})`);
+    } catch (err) {
+      console.error('[Fetcher] Error warming Redfin cookies:', err);
+    } finally {
+      if (browser) {
+        await browser.close().catch(() => {});
+      }
+      warmingPromise = null;
+    }
+  })();
+  return warmingPromise;
+}
 
 function updateRedfinCookies(setCookieHeader?: string) {
   if (!setCookieHeader) return;
@@ -1017,24 +1057,80 @@ function getRedfinCookieHeader(): string | undefined {
     .join('; ');
 }
 
-async function executeFetchRequest(url: string): Promise<FetchResult> {
+async function renderZipcodePage(url: string): Promise<FetchResult> {
+  let browser;
+  try {
+    const options = getLaunchOptionsForAttempt(1);
+    browser = await Camoufox(options);
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(3000);
+
+    const cookies = await context.cookies();
+    for (const cookie of cookies) {
+      if (cookie.domain.includes('redfin.com')) {
+        cachedRedfinCookies.set(cookie.name, cookie.value);
+      }
+    }
+    lastCookieWarmTime = Date.now();
+
+    const extracted = await page.evaluate(() => {
+      const state = (window as any).__reactServerState;
+      const cache = state?.InitialContext?.['ReactServerAgent.cache']?.dataCache || {};
+      const gisKey = Object.keys(cache).find(k => k.includes('gis'));
+      let region_id: string | null = null;
+      let region_type: string | null = null;
+      let market: string | null = null;
+      if (gisKey) {
+        try {
+          const u = new URL('https://www.redfin.com' + gisKey);
+          region_id = u.searchParams.get('region_id');
+          region_type = u.searchParams.get('region_type');
+          market = u.searchParams.get('market');
+        } catch (e) {}
+      }
+      return {
+        region_id: region_id || '32257',
+        region_type: region_type || '2',
+        market: market || 'dallas',
+        title: document.title,
+        url: window.location.href
+      };
+    });
+
+    recordScrapeResult(url, true, false);
+    updateCircuitOnSuccess('redfin');
+    return {
+      status: 200,
+      data: extracted
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+async function executeFetchRequest(url: string, retryOnBlock: boolean = true): Promise<FetchResult> {
+  const parsed = new URL(url);
+  if (parsed.pathname.startsWith('/zipcode/')) {
+    return await renderZipcodePage(url);
+  }
+
+  if (!cachedRedfinCookies.has('aws-waf-token') || Date.now() - lastCookieWarmTime > COOKIE_MAX_AGE_MS) {
+    await warmRedfinCookies();
+  }
+
   const options = getLaunchOptionsForAttempt(1);
-  const FETCH_TIMEOUT_MS = 15000; // 15s budget for the request itself
+  const FETCH_TIMEOUT_MS = 15000;
 
   console.log(`[Fetcher] Executing proxied fetch for URL: ${url}`);
   let requestContext;
   try {
     const cookieHeader = getRedfinCookieHeader();
     const extraHeaders: Record<string, string> = {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Sec-Ch-Ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': '"macOS"',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-origin',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.5',
       'Referer': 'https://www.redfin.com/'
     };
     if (cookieHeader) {
@@ -1064,6 +1160,13 @@ async function executeFetchRequest(url: string): Promise<FetchResult> {
       finalUrl.includes('ratelimited.redfin.com') ||
       isCaptchaOrBlockPage(text)
     ) {
+      if (retryOnBlock) {
+        console.warn(`[Fetcher] Request blocked with status ${status}, re-warming Camoufox session cookies and retrying...`);
+        cachedRedfinCookies.delete('aws-waf-token');
+        await warmRedfinCookies();
+        return await executeFetchRequest(url, false);
+      }
+
       console.warn(`[Fetcher] Target blocked with status ${status}, url: ${finalUrl}`);
       recordScrapeResult(url, false, true);
       updateCircuitOnBlock('redfin');
@@ -1141,7 +1244,19 @@ app.post('/fetch', async (req: Request, res: Response) => {
 
   try {
     const result = await fetchRedfinWithQueue(url);
-    res.json(result);
+    let data: any = result.data;
+    if (!data && result.body) {
+      let cleaned = result.body.trim();
+      if (cleaned.startsWith('{}&&')) {
+        cleaned = cleaned.substring(4);
+      }
+      try {
+        data = JSON.parse(cleaned);
+      } catch {
+        data = result.body;
+      }
+    }
+    return res.status(200).json({ status: 200, data });
   } catch (error) {
     console.error(`[Fetcher] Fetch failed for ${url}:`, error);
 
