@@ -10,8 +10,9 @@ const ACCESS_KEY = process.env.PHOTO_RESOLVER_TOKEN || process.env.CAMOFOX_ACCES
 
 // Browser launch options
 const LAUNCH_OPTIONS: Record<string, any> = {
-  headless: true,
-  geoip: true,
+  headless: process.env.DISPLAY ? false : true,
+  geoip: false,
+  args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
   firefoxUserPrefs: {
     'security.sandbox.content.level': 0,
     'security.sandbox.plugin.level': 0,
@@ -19,6 +20,8 @@ const LAUNCH_OPTIONS: Record<string, any> = {
     'webgl.disabled': true,
     'layers.acceleration.disabled': true,
     'gfx.webrender.software': true,
+    'browser.cache.disk.enable': false,
+    'browser.cache.memory.enable': true,
   },
 };
 
@@ -1057,6 +1060,75 @@ function getRedfinCookieHeader(): string | undefined {
     .join('; ');
 }
 
+async function fetchWithBrightData(url: string): Promise<FetchResult> {
+  if (!BRIGHTDATA_API_KEY) {
+    throw new Error('BRIGHTDATA_API_KEY is not defined');
+  }
+
+  const timeoutMs = 25000;
+  console.log(`[Fetcher] Querying Bright Data Web Unlocker for URL: ${url}`);
+  const response = await fetch('https://api.brightdata.com/request', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`
+    },
+    body: JSON.stringify({
+      zone: BRIGHTDATA_ZONE,
+      url: url,
+      format: 'raw',
+      country: 'us'
+    }),
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`[Fetcher] Bright Data API returned status ${response.status}: ${errorText}`);
+    if (response.status === 403 || response.status === 405 || response.status === 429 || response.status === 503) {
+      throw new TargetBlockedError(response.status, `Target page returned HTTP status ${response.status}`);
+    }
+    throw new Error(`Bright Data API request failed with status ${response.status}`);
+  }
+
+  const text = await response.text();
+  if (isCaptchaOrBlockPage(text)) {
+    throw new TargetBlockedError(429, 'Target page returned block page');
+  }
+
+  recordScrapeResult(url, true, false);
+  updateCircuitOnSuccess('redfin');
+
+  const parsedUrl = new URL(url);
+  if (parsedUrl.pathname.startsWith('/zipcode/')) {
+    const match = text.match(/\/stingray\/api\/gis\?[^"'\s<>]+/);
+    let region_id: string | null = null;
+    let region_type: string | null = null;
+    let market: string | null = null;
+    if (match) {
+      try {
+        const u = new URL('https://www.redfin.com' + match[0].replace(/&amp;/g, '&'));
+        region_id = u.searchParams.get('region_id');
+        region_type = u.searchParams.get('region_type');
+        market = u.searchParams.get('market');
+      } catch (e) {}
+    }
+    const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
+    return {
+      status: 200,
+      data: {
+        region_id: region_id || '32257',
+        region_type: region_type || '2',
+        market: market || 'dallas',
+        title: titleMatch ? titleMatch[1] : 'Redfin Zipcode',
+        url: url
+      }
+    };
+  }
+
+  return { status: 200, body: text };
+}
+
 async function renderZipcodePage(url: string): Promise<FetchResult> {
   let browser;
   try {
@@ -1105,6 +1177,16 @@ async function renderZipcodePage(url: string): Promise<FetchResult> {
       status: 200,
       data: extracted
     };
+  } catch (err: any) {
+    if (browser) {
+      await browser.close().catch(() => {});
+      browser = undefined;
+    }
+    if (BRIGHTDATA_API_KEY) {
+      console.warn(`[Fetcher] Camoufox failed for ${url} (${err.message}). Escalating to Bright Data Web Unlocker...`);
+      return await fetchWithBrightData(url);
+    }
+    throw err;
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
@@ -1167,6 +1249,12 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
         return await executeFetchRequest(url, false);
       }
 
+      // Layer 2: Escalate to Bright Data Web Unlocker if configured
+      if (BRIGHTDATA_API_KEY) {
+        console.warn(`[Fetcher] Layer 1 blocked with status ${status}. Escalating to Layer 2: Bright Data Web Unlocker...`);
+        return await fetchWithBrightData(url);
+      }
+
       console.warn(`[Fetcher] Target blocked with status ${status}, url: ${finalUrl}`);
       recordScrapeResult(url, false, true);
       updateCircuitOnBlock('redfin');
@@ -1179,6 +1267,16 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
   } catch (err: any) {
     if (requestContext) {
       await requestContext.dispose().catch(() => {});
+    }
+    // Layer 2: Escalate to Bright Data Web Unlocker on Layer 1 errors
+    if (BRIGHTDATA_API_KEY && !(err instanceof CircuitOpenError)) {
+      console.warn(`[Fetcher] Layer 1 error (${err.message}). Escalating to Layer 2: Bright Data Web Unlocker...`);
+      try {
+        return await fetchWithBrightData(url);
+      } catch (fallbackErr: any) {
+        console.error(`[Fetcher] Layer 2 Web Unlocker also failed:`, fallbackErr.message);
+        if (fallbackErr instanceof TargetBlockedError) throw fallbackErr;
+      }
     }
     if (err instanceof TargetBlockedError || err instanceof CircuitOpenError) {
       throw err;

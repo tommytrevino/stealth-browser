@@ -3,9 +3,9 @@ FROM mcr.microsoft.com/playwright:v1.53.1-jammy
 # Create app directory
 WORKDIR /app
 
-# Install build dependencies for native Node C++ bindings and Xvfb
+# Install build dependencies for native Node C++ bindings, Xvfb, and Mesa GLX
 RUN apt-get update && \
-    apt-get install -y python3 build-essential xvfb && \
+    apt-get install -y python3 build-essential xvfb libgl1-mesa-glx libgl1-mesa-dri && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy package configuration files
