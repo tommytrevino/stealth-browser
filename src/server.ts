@@ -623,66 +623,68 @@ async function scrapeWithBrightData(url: string): Promise<ScrapeResult> {
 async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>): Promise<ScrapeResult> {
   const target = getUrlTarget(url);
 
-  // Route Zillow, Realtor, Homes.com, and Redfin through Bright Data Web Unlocker if configured
-  if ((target === 'zillow' || target === 'realtor' || target === 'homes' || target === 'redfin') && BRIGHTDATA_API_KEY) {
-    try {
-      return await scrapeWithBrightData(url);
-    } catch (error) {
-      console.warn(`[Scraper] Bright Data Web Unlocker failed for ${url}: ${(error as Error).message}.`);
-      if (error instanceof TargetBlockedError) throw error;
-    }
-  }
-
-  // Layer 1: Try standalone HTTP GET request first
+  // Layer 1: Fast standalone HTTP GET via rotating proxy (~900ms)
   try {
-    console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET for URL: ${url}`);
+    console.log(`[Scraper] Attempt ${attempt}: Layer 1 fast HTTP GET for URL: ${url}`);
+    const cookieHeader = target === 'redfin' ? getRedfinCookieHeader() : undefined;
+    const extraHeaders: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+      'Referer': target === 'redfin' ? 'https://www.redfin.com/' : (target === 'zillow' ? 'https://www.zillow.com/' : 'https://www.google.com/')
+    };
+    if (cookieHeader) {
+      extraHeaders['Cookie'] = cookieHeader;
+    }
+
     const requestContext = await request.newContext({
       proxy: options.proxy,
-      extraHTTPHeaders: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1'
-      }
+      extraHTTPHeaders: extraHeaders
     });
 
     const response = await requestContext.get(url, { timeout: 6000 });
     const status = response.status();
-    console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET response status: ${status}`);
-
-    if (status === 405 || status === 403 || status === 429 || status === 503) {
-      await requestContext.dispose();
-      throw new TargetBlockedError(status, `Target page returned HTTP status ${status}`);
-    }
+    console.log(`[Scraper] Attempt ${attempt}: Layer 1 HTTP response status: ${status}`);
 
     if (status === 200) {
       const html = await response.text();
-      
-      if (isCaptchaOrBlockPage(html)) {
-        console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET hit a Captcha/Block page.`);
-        await requestContext.dispose();
-      } else {
+      await requestContext.dispose();
+
+      if (!isCaptchaOrBlockPage(html)) {
         const photos = extractPhotosFromHtml(html);
-        await requestContext.dispose();
         if (photos.length > 0) {
-          console.log(`[Scraper] Attempt ${attempt}: Standalone HTTP GET successful. Extracted ${photos.length} photos.`);
+          console.log(`[Scraper] Attempt ${attempt}: Layer 1 successful in fast path. Extracted ${photos.length} photos.`);
           const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
           return {
             photos,
             ...metadata
           };
         }
+      } else {
+        console.log(`[Scraper] Attempt ${attempt}: Layer 1 hit captcha/block page.`);
       }
     } else {
       await requestContext.dispose();
+      console.warn(`[Scraper] Attempt ${attempt}: Layer 1 returned HTTP status ${status}.`);
     }
-  } catch (err) {
-    if (err instanceof TargetBlockedError) throw err;
-    console.warn(`[Scraper] Attempt ${attempt}: Standalone HTTP GET failed: ${(err as Error).message}`);
+  } catch (err: any) {
+    console.warn(`[Scraper] Attempt ${attempt}: Layer 1 failed (${err.message}).`);
+  }
+
+  // Layer 2: Escalate to Bright Data Web Unlocker if configured (Guaranteed Fallback)
+  if ((target === 'zillow' || target === 'realtor' || target === 'homes' || target === 'redfin') && BRIGHTDATA_API_KEY) {
+    try {
+      console.log(`[Scraper] Attempt ${attempt}: Escalating to Layer 2 (Bright Data Web Unlocker) for ${url}`);
+      return await scrapeWithBrightData(url);
+    } catch (error) {
+      console.warn(`[Scraper] Bright Data Web Unlocker failed for ${url}: ${(error as Error).message}.`);
+      if (error instanceof TargetBlockedError) throw error;
+    }
   }
 
   // Layer 2: Launch browser & try browser-context request
