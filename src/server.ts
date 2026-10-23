@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import { Camoufox } from 'camoufox-js';
-import { request, type Browser } from 'playwright-core';
+import { request, type APIRequestContext, type Browser } from 'playwright-core';
 
 const app = express();
 app.use(express.json());
@@ -266,13 +266,17 @@ interface TraceStep {
   ms: number;
   status?: number;
   detail?: string;
+  tokenAgeMs?: number; // age of the Redfin WAF token sent with the request, when one was
 }
+
+type StepExtra = Pick<TraceStep, 'status' | 'detail' | 'tokenAgeMs'>;
 
 const BLOCK_STATUSES = new Set([403, 405, 429, 503]);
 
 // One request's path through the layers, logged as a single JSON line when its response is sent
 class RequestTrace {
   readonly steps: TraceStep[] = [];
+  readonly notes: string[] = [];
   readonly startedAt = Date.now();
   reason = 'ok';
   error: string | null = null;
@@ -280,15 +284,15 @@ class RequestTrace {
 
   constructor(readonly endpoint: '/scrape' | '/fetch', readonly url: string, readonly site: string) {}
 
-  record(layer: string, attempt: number, result: StepResult, startedAt: number, extra: { status?: number; detail?: string } = {}) {
+  record(layer: string, attempt: number, result: StepResult, startedAt: number, extra: StepExtra = {}) {
     const step: TraceStep = { layer, attempt, result, ms: Date.now() - startedAt, ...extra };
     this.steps.push(step);
     recordLayerStep(this.endpoint, this.site, step);
   }
 
-  recordError(layer: string, attempt: number, err: unknown, startedAt: number) {
+  recordError(layer: string, attempt: number, err: unknown, startedAt: number, extra: StepExtra = {}) {
     const { result, status } = classifyError(err);
-    this.record(layer, attempt, result, startedAt, { status, detail: errorDetail(err) });
+    this.record(layer, attempt, result, startedAt, { status, detail: errorDetail(err), ...extra });
   }
 
   log(status: number) {
@@ -302,6 +306,7 @@ class RequestTrace {
       error: this.error,
       photos: this.photos,
       totalMs: Date.now() - this.startedAt,
+      notes: this.notes,
       steps: this.steps,
     }));
   }
@@ -804,10 +809,11 @@ async function scrapeWithBrightData(url: string, attempt: number, trace: Request
 async function scrapeWithFastGet(url: string, attempt: number, options: Record<string, any>, trace: RequestTrace): Promise<ScrapeResult | null> {
   const target = getUrlTarget(url);
   const startedAt = Date.now();
+  const tokenAgeMs = target === 'redfin' ? redfinSession.tokenAgeMs() ?? undefined : undefined;
 
   try {
     console.log(`[Scraper] Attempt ${attempt}: Layer 1 fast HTTP GET for URL: ${url}`);
-    const cookieHeader = target === 'redfin' ? getRedfinCookieHeader() : undefined;
+    const cookieHeader = target === 'redfin' ? redfinSession.cookieHeader() : undefined;
     const extraHeaders: Record<string, string> = {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -841,20 +847,20 @@ async function scrapeWithFastGet(url: string, attempt: number, options: Record<s
           if (photos.length > 0) {
             console.log(`[Scraper] Attempt ${attempt}: Layer 1 successful in fast path. Extracted ${photos.length} photos.`);
             const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
-            trace.record('fast', attempt, 'ok', startedAt, { status });
+            trace.record('fast', attempt, 'ok', startedAt, { status, tokenAgeMs });
             return {
               photos,
               ...metadata
             };
           }
-          trace.record('fast', attempt, 'empty', startedAt, { status });
+          trace.record('fast', attempt, 'empty', startedAt, { status, tokenAgeMs });
         } else {
           console.log(`[Scraper] Attempt ${attempt}: Layer 1 hit captcha/block page.`);
-          trace.record('fast', attempt, 'blocked', startedAt, { status, detail: 'block page' });
+          trace.record('fast', attempt, 'blocked', startedAt, { status, detail: 'block page', tokenAgeMs });
         }
       } else {
         console.warn(`[Scraper] Attempt ${attempt}: Layer 1 returned HTTP status ${status}.`);
-        trace.record('fast', attempt, BLOCK_STATUSES.has(status) ? 'blocked' : 'http_error', startedAt, { status });
+        trace.record('fast', attempt, BLOCK_STATUSES.has(status) ? 'blocked' : 'http_error', startedAt, { status, tokenAgeMs });
       }
     } finally {
       // Disposed on every path, a timeout included, so contexts don't pile up for the life of the process
@@ -862,7 +868,7 @@ async function scrapeWithFastGet(url: string, attempt: number, options: Record<s
     }
   } catch (err: any) {
     console.warn(`[Scraper] Attempt ${attempt}: Layer 1 failed (${err.message}).`);
-    trace.recordError('fast', attempt, err, startedAt);
+    trace.recordError('fast', attempt, err, startedAt, { tokenAgeMs });
   }
   return null;
 }
@@ -1268,76 +1274,186 @@ interface FetchResult {
   data?: any;
 }
 
-let cachedRedfinCookies: Map<string, string> = new Map();
-let warmingPromise: Promise<Error | null> | null = null;
-let lastCookieWarmTime = 0;
-const COOKIE_MAX_AGE_MS = 20 * 60 * 1000; // 20 minutes
+const COOKIE_MAX_AGE_MS = 20 * 60 * 1000; // without Bright Data, a token older than this is refreshed before use
+const COOKIE_REFRESH_AHEAD_MS = 15 * 60 * 1000; // past this age, a request starts a background refresh
+const COOKIE_TOKEN_WAIT_MS = 10 * 1000; // how long a refresh waits for aws-waf-token once the page has loaded
+const COOKIE_REFRESH_BACKOFF_BASE_MS = 30 * 1000; // doubles with each failure, up to the max
+const COOKIE_REFRESH_BACKOFF_MAX_MS = 5 * 60 * 1000;
+const FRESH_TOKEN_BLOCK_MS = 60 * 1000; // a token blocked this soon after it arrived counts as a failed refresh
 
-// Resolves to null when this warm received an aws-waf-token, or to the reason it didn't
-async function warmRedfinCookies(): Promise<Error | null> {
-  if (warmingPromise) {
-    return warmingPromise;
+// Redfin's session cookies, above all the AWS WAF token, shared by /fetch and the Redfin fast GET.
+// All session state lives here, so sharing it across replicas (e.g. Redis) changes only this class.
+class RedfinSession {
+  private cookies = new Map<string, string>();
+  private tokenReceivedAt: number | null = null;
+  private refreshing: Promise<Error | null> | null = null;
+  // Refreshes in a row that didn't produce a working token; reset when a request gets through
+  private failures = 0;
+  private nextRefreshAt = 0;
+
+  cookieHeader(): string | undefined {
+    if (this.cookies.size === 0) return undefined;
+    return Array.from(this.cookies.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
   }
-  warmingPromise = (async () => {
-    let browser;
-    try {
-      console.log('[Fetcher] Warming Redfin session and WAF tokens via Camoufox...');
-      const options = getLaunchOptionsForAttempt(1);
-      browser = await Camoufox(options);
-      const context = await browser.newContext();
-      const page = await context.newPage();
-      await page.goto('https://www.redfin.com', { waitUntil: 'networkidle' });
-      await page.waitForTimeout(2500);
-      const cookies = await context.cookies();
-      let receivedToken = false;
-      for (const cookie of cookies) {
-        if (cookie.domain.includes('redfin.com')) {
-          cachedRedfinCookies.set(cookie.name, cookie.value);
-          if (cookie.name === 'aws-waf-token') receivedToken = true;
+
+  hasToken(): boolean {
+    return this.cookies.has('aws-waf-token');
+  }
+
+  tokenAgeMs(): number | null {
+    return this.hasToken() && this.tokenReceivedAt !== null ? Date.now() - this.tokenReceivedAt : null;
+  }
+
+  // No token, or old enough that the next request should start a background refresh
+  needsRefreshSoon(): boolean {
+    const age = this.tokenAgeMs();
+    return age === null || age > COOKIE_REFRESH_AHEAD_MS;
+  }
+
+  // No token, or too old to use without refreshing first
+  isStale(): boolean {
+    const age = this.tokenAgeMs();
+    return age === null || age > COOKIE_MAX_AGE_MS;
+  }
+
+  // A request got through to Redfin, so refreshing is working again
+  markWorked(): void {
+    this.failures = 0;
+    this.nextRefreshAt = 0;
+  }
+
+  // After a block. A token blocked within FRESH_TOKEN_BLOCK_MS of arriving means refreshing isn't helping,
+  // so it backs off rather than launching a browser after every block.
+  invalidateToken(): void {
+    const age = this.tokenAgeMs();
+    this.cookies.delete('aws-waf-token');
+    this.tokenReceivedAt = null;
+    if (age !== null && age < FRESH_TOKEN_BLOCK_MS) this.recordFailure();
+  }
+
+  // Cookies from a browser context; returns whether an aws-waf-token was among them
+  absorb(cookies: { name: string; value: string; domain: string }[]): boolean {
+    let receivedToken = false;
+    for (const cookie of cookies) {
+      if (cookie.domain.includes('redfin.com')) {
+        this.cookies.set(cookie.name, cookie.value);
+        if (cookie.name === 'aws-waf-token') receivedToken = true;
+      }
+    }
+    if (receivedToken) this.tokenReceivedAt = Date.now();
+    return receivedToken;
+  }
+
+  absorbSetCookie(setCookieHeader?: string): void {
+    if (!setCookieHeader) return;
+    const lines = setCookieHeader.split(/\r?\n|, (?=[a-zA-Z0-9_-]+=)/);
+    for (const line of lines) {
+      const parts = line.split(';')[0]?.trim();
+      if (parts && parts.includes('=')) {
+        const [name, ...val] = parts.split('=');
+        if (name && val) {
+          this.cookies.set(name.trim(), val.join('=').trim());
+          if (name.trim() === 'aws-waf-token') this.tokenReceivedAt = Date.now();
         }
       }
-      lastCookieWarmTime = Date.now();
-      console.log(`[Fetcher] Successfully warmed Redfin cookies (${cachedRedfinCookies.size} cookies cached, aws-waf-token: ${cachedRedfinCookies.has('aws-waf-token')})`);
-      return receivedToken ? null : new Error('Warm finished without an aws-waf-token cookie');
+    }
+  }
+
+  // One refresh at a time; while backing off it resolves at once with the reason instead of launching a browser.
+  // Resolves to null when the refresh received an aws-waf-token.
+  refresh(): Promise<Error | null> {
+    if (this.refreshing) return this.refreshing;
+    const waitMs = this.nextRefreshAt - Date.now();
+    if (waitMs > 0) {
+      return Promise.resolve(new Error(`Redfin cookie refresh backing off for ${Math.ceil(waitMs / 1000)}s after ${this.failures} failure(s)`));
+    }
+
+    const startedAt = Date.now();
+    this.refreshing = this.loadHomepage().then((failure) => {
+      if (failure) this.recordFailure();
+      this.refreshing = null;
+      const result = failure ? classifyError(failure).result : 'ok';
+      const ms = Date.now() - startedAt;
+      recordLayerStep('/fetch', 'redfin', { layer: 'cookie_refresh', attempt: 0, result, ms });
+      console.log(JSON.stringify({
+        msg: 'cookie_refresh',
+        result,
+        ms,
+        error: failure ? errorDetail(failure) : null,
+        failures: this.failures,
+        backoffSec: Math.max(0, Math.ceil((this.nextRefreshAt - Date.now()) / 1000)),
+      }));
+      return failure;
+    });
+    return this.refreshing;
+  }
+
+  refreshInBackground(): void {
+    if (this.refreshing || Date.now() < this.nextRefreshAt) return;
+    void this.refresh();
+  }
+
+  status() {
+    const age = this.tokenAgeMs();
+    return {
+      hasToken: this.hasToken(),
+      tokenAgeSec: age === null ? null : Math.round(age / 1000),
+      refreshing: this.refreshing !== null,
+      failures: this.failures,
+      backoffSec: Math.max(0, Math.ceil((this.nextRefreshAt - Date.now()) / 1000)),
+    };
+  }
+
+  private recordFailure(): void {
+    this.failures++;
+    this.nextRefreshAt = Date.now() + Math.min(COOKIE_REFRESH_BACKOFF_MAX_MS, COOKIE_REFRESH_BACKOFF_BASE_MS * 2 ** (this.failures - 1));
+  }
+
+  private async loadHomepage(): Promise<Error | null> {
+    let browser: Browser | undefined;
+    await browserSemaphore.acquire();
+    try {
+      console.log('[Fetcher] Warming Redfin session and WAF tokens via Camoufox...');
+      const launched: Browser = await Camoufox(getLaunchOptionsForAttempt(1));
+      browser = launched;
+      const context = await launched.newContext();
+      const page = await context.newPage();
+      await page.goto('https://www.redfin.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+      // The token is set by a script shortly after the page loads, so wait for the cookie itself
+      // rather than for the network to go idle
+      const hasToken = (cookies: { name: string; domain: string }[]) =>
+        cookies.some((c) => c.name === 'aws-waf-token' && c.domain.includes('redfin.com'));
+      const deadline = Date.now() + COOKIE_TOKEN_WAIT_MS;
+      let cookies = await context.cookies();
+      while (!hasToken(cookies) && Date.now() < deadline) {
+        await page.waitForTimeout(250);
+        cookies = await context.cookies();
+      }
+
+      const receivedToken = this.absorb(cookies);
+      console.log(`[Fetcher] Warmed Redfin cookies (${this.cookies.size} cookies cached, aws-waf-token received: ${receivedToken})`);
+      return receivedToken ? null : new Error(`No aws-waf-token cookie within ${COOKIE_TOKEN_WAIT_MS / 1000}s of the page loading`);
     } catch (err) {
       console.error('[Fetcher] Error warming Redfin cookies:', err);
       return err instanceof Error ? err : new Error(String(err));
     } finally {
-      if (browser) {
-        await browser.close().catch(() => {});
-      }
-      warmingPromise = null;
-    }
-  })();
-  return warmingPromise;
-}
-
-async function warmRedfinCookiesTraced(trace: RequestTrace, attempt: number): Promise<void> {
-  const startedAt = Date.now();
-  const failure = await warmRedfinCookies();
-  if (failure) trace.recordError('cookie_warm', attempt, failure, startedAt);
-  else trace.record('cookie_warm', attempt, 'ok', startedAt);
-}
-
-function updateRedfinCookies(setCookieHeader?: string) {
-  if (!setCookieHeader) return;
-  const lines = setCookieHeader.split(/\r?\n|, (?=[a-zA-Z0-9_-]+=)/);
-  for (const line of lines) {
-    const parts = line.split(';')[0]?.trim();
-    if (parts && parts.includes('=')) {
-      const [name, ...val] = parts.split('=');
-      if (name && val) {
-        cachedRedfinCookies.set(name.trim(), val.join('=').trim());
-      }
+      if (browser) await browser.close().catch(() => {});
+      browserSemaphore.release();
     }
   }
 }
 
-function getRedfinCookieHeader(): string | undefined {
-  if (cachedRedfinCookies.size === 0) return undefined;
-  return Array.from(cachedRedfinCookies.entries())
-    .map(([k, v]) => `${k}=${v}`)
-    .join('; ');
+const redfinSession = new RedfinSession();
+
+// A request waiting on a refresh (only without Bright Data); the refresh itself is logged as cookie_refresh
+async function waitForCookieRefresh(trace: RequestTrace, attempt: number): Promise<void> {
+  const startedAt = Date.now();
+  const failure = await redfinSession.refresh();
+  if (failure) trace.recordError('cookie_wait', attempt, failure, startedAt);
+  else trace.record('cookie_wait', attempt, 'ok', startedAt);
 }
 
 async function fetchWithBrightData(url: string, trace: RequestTrace, attempt: number): Promise<FetchResult> {
@@ -1432,13 +1548,7 @@ async function renderZipcodePage(url: string, trace: RequestTrace): Promise<Fetc
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(3000);
 
-    const cookies = await context.cookies();
-    for (const cookie of cookies) {
-      if (cookie.domain.includes('redfin.com')) {
-        cachedRedfinCookies.set(cookie.name, cookie.value);
-      }
-    }
-    lastCookieWarmTime = Date.now();
+    redfinSession.absorb(await context.cookies());
 
     const extracted = await page.evaluate(() => {
       const state = (window as any).__reactServerState;
@@ -1491,28 +1601,21 @@ async function renderZipcodePage(url: string, trace: RequestTrace): Promise<Fetc
   }
 }
 
-async function executeFetchRequest(url: string, trace: RequestTrace, retryOnBlock: boolean = true): Promise<FetchResult> {
-  const parsed = new URL(url);
-  if (parsed.pathname.startsWith('/zipcode/')) {
-    return await renderZipcodePage(url, trace);
-  }
-
-  const attempt = retryOnBlock ? 1 : 2;
-  if (!cachedRedfinCookies.has('aws-waf-token') || Date.now() - lastCookieWarmTime > COOKIE_MAX_AGE_MS) {
-    await warmRedfinCookiesTraced(trace, attempt);
-  }
-
-  const options = getLaunchOptionsForAttempt(1);
+// Layer 1 for /fetch: the Redfin request itself, through the proxy with the session's cookies
+async function fetchRedfinDirect(
+  url: string,
+  trace: RequestTrace,
+  attempt: number
+): Promise<{ kind: 'ok'; result: FetchResult } | { kind: 'blocked'; status: number; finalUrl: string } | { kind: 'error'; err: unknown }> {
   const FETCH_TIMEOUT_MS = 15000;
+  const options = getLaunchOptionsForAttempt(1);
+  const tokenAgeMs = redfinSession.tokenAgeMs() ?? undefined;
+  const startedAt = Date.now();
 
   console.log(`[Fetcher] Executing proxied fetch for URL: ${url}`);
-  let requestContext;
-  // Set once the request is passed to the retry or to Bright Data, so the catch below doesn't escalate their errors again
-  let handedOff = false;
-  const fastStart = Date.now();
-  let fastRecorded = false;
+  let requestContext: APIRequestContext | undefined;
   try {
-    const cookieHeader = getRedfinCookieHeader();
+    const cookieHeader = redfinSession.cookieHeader();
     const extraHeaders: Record<string, string> = {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0',
       'Accept': '*/*',
@@ -1533,59 +1636,55 @@ async function executeFetchRequest(url: string, trace: RequestTrace, retryOnBloc
     const finalUrl = response.url();
     const rawHeaders = response.headers();
     if (rawHeaders['set-cookie']) {
-      updateRedfinCookies(rawHeaders['set-cookie']);
+      redfinSession.absorbSetCookie(rawHeaders['set-cookie']);
     }
-
     const text = await response.text();
-    await requestContext.dispose();
 
-    if (
-      status === 403 ||
-      status === 429 ||
-      status === 503 ||
-      finalUrl.includes('ratelimited.redfin.com') ||
-      isCaptchaOrBlockPage(text)
-    ) {
-      trace.record('fast', attempt, 'blocked', fastStart, {
-        status,
-        detail: finalUrl.includes('ratelimited.redfin.com') ? 'ratelimited redirect' : isCaptchaOrBlockPage(text) ? 'block page' : undefined,
-      });
-      fastRecorded = true;
-
-      if (retryOnBlock) {
-        console.warn(`[Fetcher] Request blocked with status ${status}, re-warming Camoufox session cookies and retrying...`);
-        handedOff = true;
-        cachedRedfinCookies.delete('aws-waf-token');
-        await warmRedfinCookiesTraced(trace, attempt);
-        return await executeFetchRequest(url, trace, false);
-      }
-
-      // Layer 2: Escalate to Bright Data Web Unlocker if configured
-      if (BRIGHTDATA_API_KEY) {
-        console.warn(`[Fetcher] Layer 1 blocked with status ${status}. Escalating to Layer 2: Bright Data Web Unlocker...`);
-        handedOff = true;
-        return await fetchWithBrightData(url, trace, attempt);
-      }
-
-      console.warn(`[Fetcher] Target blocked with status ${status}, url: ${finalUrl}`);
-      recordScrapeResult(url, false, true);
-      updateCircuitOnBlock('redfin');
-      throw new TargetBlockedError(429, `Target page returned HTTP status ${status}`);
+    const blockedBy = finalUrl.includes('ratelimited.redfin.com') ? 'ratelimited redirect' : isCaptchaOrBlockPage(text) ? 'block page' : undefined;
+    if (status === 403 || status === 429 || status === 503 || blockedBy) {
+      trace.record('fast', attempt, 'blocked', startedAt, { status, detail: blockedBy, tokenAgeMs });
+      return { kind: 'blocked', status, finalUrl };
     }
 
-    trace.record('fast', attempt, status >= 200 && status < 300 ? 'ok' : 'http_error', fastStart, { status });
-    fastRecorded = true;
+    trace.record('fast', attempt, status >= 200 && status < 300 ? 'ok' : 'http_error', startedAt, { status, tokenAgeMs });
+    return { kind: 'ok', result: { status, body: text } };
+  } catch (err) {
+    trace.recordError('fast', attempt, err, startedAt, { tokenAgeMs });
+    return { kind: 'error', err };
+  } finally {
+    await requestContext?.dispose().catch(() => {});
+  }
+}
+
+async function fetchRedfinLayers(url: string, trace: RequestTrace, retryOnBlock: boolean): Promise<FetchResult> {
+  const attempt = retryOnBlock ? 1 : 2;
+  let refreshedNow = false;
+
+  if (BRIGHTDATA_API_KEY) {
+    // Never wait on a browser: the cookie refreshes in the background, and Bright Data answers until it arrives
+    if (redfinSession.needsRefreshSoon()) redfinSession.refreshInBackground();
+    if (!redfinSession.hasToken()) {
+      trace.notes.push('no Redfin WAF token yet, so straight to Bright Data');
+      return await fetchWithBrightData(url, trace, attempt);
+    }
+  } else if (retryOnBlock && redfinSession.isStale()) {
+    await waitForCookieRefresh(trace, attempt);
+    refreshedNow = true;
+  }
+
+  const direct = await fetchRedfinDirect(url, trace, attempt);
+
+  if (direct.kind === 'ok') {
+    redfinSession.markWorked();
     recordScrapeResult(url, true, false);
     updateCircuitOnSuccess('redfin');
-    return { status, body: text };
-  } catch (err: any) {
-    if (!fastRecorded) trace.recordError('fast', attempt, err, fastStart);
-    if (requestContext) {
-      await requestContext.dispose().catch(() => {});
-    }
+    return direct.result;
+  }
+
+  if (direct.kind === 'error') {
     // Layer 2: Escalate to Bright Data Web Unlocker on Layer 1 errors
-    if (BRIGHTDATA_API_KEY && !handedOff && !(err instanceof CircuitOpenError)) {
-      console.warn(`[Fetcher] Layer 1 error (${err.message}). Escalating to Layer 2: Bright Data Web Unlocker...`);
+    if (BRIGHTDATA_API_KEY) {
+      console.warn(`[Fetcher] Layer 1 error (${(direct.err as Error)?.message}). Escalating to Layer 2: Bright Data Web Unlocker...`);
       try {
         return await fetchWithBrightData(url, trace, attempt);
       } catch (fallbackErr: any) {
@@ -1593,15 +1692,55 @@ async function executeFetchRequest(url: string, trace: RequestTrace, retryOnBloc
         if (fallbackErr instanceof TargetBlockedError) throw fallbackErr;
       }
     }
-    if (err instanceof TargetBlockedError || err instanceof CircuitOpenError) {
-      throw err;
-    }
-    const msg = err?.message?.toLowerCase() || '';
-    if (err?.name === 'TimeoutError' || msg.includes('timeout') || msg.includes('timed out')) {
-      console.warn(`[Fetcher] Request timed out for URL: ${url}`);
-      throw new FetchTimeoutError('Request timed out');
-    }
-    throw err;
+    throw direct.err;
+  }
+
+  // Blocked: the token didn't get us in
+  redfinSession.invalidateToken();
+
+  // Layer 2: Escalate to Bright Data Web Unlocker if configured
+  if (BRIGHTDATA_API_KEY) {
+    console.warn(`[Fetcher] Layer 1 blocked with status ${direct.status}. Refreshing cookies in the background; escalating to Layer 2: Bright Data Web Unlocker...`);
+    redfinSession.refreshInBackground();
+    return await fetchWithBrightData(url, trace, attempt);
+  }
+
+  // Without Bright Data, one refresh per request at most: retry only if this request hasn't refreshed yet
+  if (retryOnBlock && !refreshedNow) {
+    console.warn(`[Fetcher] Request blocked with status ${direct.status}, re-warming Camoufox session cookies and retrying...`);
+    await waitForCookieRefresh(trace, attempt);
+    return await fetchRedfinLayers(url, trace, false);
+  }
+
+  console.warn(`[Fetcher] Target blocked with status ${direct.status}, url: ${direct.finalUrl}`);
+  recordScrapeResult(url, false, true);
+  updateCircuitOnBlock('redfin');
+  throw new TargetBlockedError(429, `Target page returned HTTP status ${direct.status}`);
+}
+
+// Errors leave /fetch as a block, an open circuit, a timeout, or as they are
+function toFetchError(err: any, url: string): unknown {
+  if (err instanceof TargetBlockedError || err instanceof CircuitOpenError || err instanceof FetchTimeoutError) {
+    return err;
+  }
+  const msg = err?.message?.toLowerCase() || '';
+  if (err?.name === 'TimeoutError' || msg.includes('timeout') || msg.includes('timed out')) {
+    console.warn(`[Fetcher] Request timed out for URL: ${url}`);
+    return new FetchTimeoutError('Request timed out');
+  }
+  return err;
+}
+
+async function executeFetchRequest(url: string, trace: RequestTrace): Promise<FetchResult> {
+  const parsed = new URL(url);
+  if (parsed.pathname.startsWith('/zipcode/')) {
+    return await renderZipcodePage(url, trace);
+  }
+
+  try {
+    return await fetchRedfinLayers(url, trace, true);
+  } catch (err) {
+    throw toFetchError(err, url);
   }
 }
 
@@ -1728,6 +1867,7 @@ app.get('/health', (_req: Request, res: Response) => {
     status: deriveStatus(),
     uptime: process.uptime(),
     stats: formattedStats,
+    redfinSession: redfinSession.status(),
     layers: getLayerStats(),
   });
 });
