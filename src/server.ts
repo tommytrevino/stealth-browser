@@ -647,30 +647,33 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
       extraHTTPHeaders: extraHeaders
     });
 
-    const response = await requestContext.get(url, { timeout: 6000 });
-    const status = response.status();
-    console.log(`[Scraper] Attempt ${attempt}: Layer 1 HTTP response status: ${status}`);
+    try {
+      const response = await requestContext.get(url, { timeout: 6000 });
+      const status = response.status();
+      console.log(`[Scraper] Attempt ${attempt}: Layer 1 HTTP response status: ${status}`);
 
-    if (status === 200) {
-      const html = await response.text();
-      await requestContext.dispose();
+      if (status === 200) {
+        const html = await response.text();
 
-      if (!isCaptchaOrBlockPage(html)) {
-        const photos = extractPhotosFromHtml(html);
-        if (photos.length > 0) {
-          console.log(`[Scraper] Attempt ${attempt}: Layer 1 successful in fast path. Extracted ${photos.length} photos.`);
-          const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
-          return {
-            photos,
-            ...metadata
-          };
+        if (!isCaptchaOrBlockPage(html)) {
+          const photos = extractPhotosFromHtml(html);
+          if (photos.length > 0) {
+            console.log(`[Scraper] Attempt ${attempt}: Layer 1 successful in fast path. Extracted ${photos.length} photos.`);
+            const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
+            return {
+              photos,
+              ...metadata
+            };
+          }
+        } else {
+          console.log(`[Scraper] Attempt ${attempt}: Layer 1 hit captcha/block page.`);
         }
       } else {
-        console.log(`[Scraper] Attempt ${attempt}: Layer 1 hit captcha/block page.`);
+        console.warn(`[Scraper] Attempt ${attempt}: Layer 1 returned HTTP status ${status}.`);
       }
-    } else {
-      await requestContext.dispose();
-      console.warn(`[Scraper] Attempt ${attempt}: Layer 1 returned HTTP status ${status}.`);
+    } finally {
+      // Disposed on every path, a timeout included, so contexts don't pile up for the life of the process
+      await requestContext.dispose().catch(() => {});
     }
   } catch (err: any) {
     console.warn(`[Scraper] Attempt ${attempt}: Layer 1 failed (${err.message}).`);
