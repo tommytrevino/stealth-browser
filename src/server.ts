@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import { Camoufox } from 'camoufox-js';
-import { request } from 'playwright-core';
+import { request, type Browser } from 'playwright-core';
 
 const app = express();
 app.use(express.json());
@@ -46,6 +46,24 @@ if (process.env.PROXY_URL) {
 
 const BRIGHTDATA_API_KEY = process.env.BRIGHTDATA_API_KEY;
 const BRIGHTDATA_ZONE = process.env.BRIGHTDATA_ZONE || 'web_unlocker1';
+const BRIGHTDATA_TARGETS = ['zillow', 'realtor', 'homes', 'redfin'];
+
+// Sites whose /scrape asks Bright Data before the fast HTTP GET, e.g. BRIGHTDATA_FIRST=zillow,realtor
+const BRIGHTDATA_FIRST = new Set(
+  (process.env.BRIGHTDATA_FIRST || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+);
+for (const site of BRIGHTDATA_FIRST) {
+  if (!BRIGHTDATA_TARGETS.includes(site)) {
+    console.warn(`[Scraper] BRIGHTDATA_FIRST names "${site}", which is not a Bright Data site (${BRIGHTDATA_TARGETS.join(', ')}). Ignored.`);
+  }
+}
+if (BRIGHTDATA_FIRST.size > 0 && !BRIGHTDATA_API_KEY) {
+  console.warn('[Scraper] BRIGHTDATA_FIRST is set but BRIGHTDATA_API_KEY is not, so it has no effect.');
+}
+
+function usesBrightData(target: string): boolean {
+  return BRIGHTDATA_TARGETS.includes(target) && !!BRIGHTDATA_API_KEY;
+}
 
 class TargetBlockedError extends Error {
   constructor(readonly status: number, message: string) {
@@ -65,6 +83,23 @@ class FetchTimeoutError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'FetchTimeoutError';
+  }
+}
+
+// A page that passed the block checks but held no photos. It stays a TargetBlockedError so every
+// existing check treats it as before; the trace is what tells it apart from a block.
+class EmptyPageError extends TargetBlockedError {
+  constructor(message: string) {
+    super(429, message);
+    this.name = 'EmptyPageError';
+  }
+}
+
+// Bright Data answered with an HTTP error that isn't one of the block statuses
+class UpstreamStatusError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = 'UpstreamStatusError';
   }
 }
 
@@ -220,6 +255,144 @@ function deriveStatus(): string {
   }
 
   return degraded ? 'degraded' : 'ok';
+}
+
+type StepResult = 'ok' | 'blocked' | 'empty' | 'http_error' | 'timeout' | 'error';
+
+interface TraceStep {
+  layer: string;
+  attempt: number; // 0 for steps outside the retry loop, such as the Redfin queue
+  result: StepResult;
+  ms: number;
+  status?: number;
+  detail?: string;
+}
+
+const BLOCK_STATUSES = new Set([403, 405, 429, 503]);
+
+// One request's path through the layers, logged as a single JSON line when its response is sent
+class RequestTrace {
+  readonly steps: TraceStep[] = [];
+  readonly startedAt = Date.now();
+  reason = 'ok';
+  error: string | null = null;
+  photos: number | null = null;
+
+  constructor(readonly endpoint: '/scrape' | '/fetch', readonly url: string, readonly site: string) {}
+
+  record(layer: string, attempt: number, result: StepResult, startedAt: number, extra: { status?: number; detail?: string } = {}) {
+    const step: TraceStep = { layer, attempt, result, ms: Date.now() - startedAt, ...extra };
+    this.steps.push(step);
+    recordLayerStep(this.endpoint, this.site, step);
+  }
+
+  recordError(layer: string, attempt: number, err: unknown, startedAt: number) {
+    const { result, status } = classifyError(err);
+    this.record(layer, attempt, result, startedAt, { status, detail: errorDetail(err) });
+  }
+
+  log(status: number) {
+    console.log(JSON.stringify({
+      msg: 'request_trace',
+      endpoint: this.endpoint,
+      site: this.site,
+      url: this.url,
+      status,
+      reason: this.reason,
+      error: this.error,
+      photos: this.photos,
+      totalMs: Date.now() - this.startedAt,
+      steps: this.steps,
+    }));
+  }
+}
+
+function classifyError(err: unknown): { result: StepResult; status?: number } {
+  if (err instanceof EmptyPageError) return { result: 'empty' };
+  if (err instanceof TargetBlockedError) {
+    return { result: BLOCK_STATUSES.has(err.status) ? 'blocked' : 'http_error', status: err.status };
+  }
+  if (err instanceof UpstreamStatusError) return { result: 'http_error', status: err.status };
+  const e = err as { name?: string; message?: string } | null;
+  const msg = e?.message?.toLowerCase() || '';
+  if (e?.name === 'TimeoutError' || msg.includes('timeout') || msg.includes('timed out')) return { result: 'timeout' };
+  return { result: 'error' };
+}
+
+function errorDetail(err: unknown): string {
+  return toStatusMessage(String((err as Error | null)?.message ?? err)).slice(0, 200);
+}
+
+interface LayerStepRecord {
+  at: number;
+  endpoint: string;
+  site: string;
+  layer: string;
+  result: StepResult;
+  ms: number;
+}
+
+// The most recent layer steps, for the per-layer numbers on /health. Bounded so memory stays flat
+// under load; the request_trace log lines are the complete record.
+const LAYER_STEP_LIMIT = 10000;
+const layerSteps: LayerStepRecord[] = [];
+let nextLayerStep = 0;
+
+function recordLayerStep(endpoint: string, site: string, step: TraceStep) {
+  const record: LayerStepRecord = { at: Date.now(), endpoint, site, layer: step.layer, result: step.result, ms: step.ms };
+  if (layerSteps.length < LAYER_STEP_LIMIT) {
+    layerSteps.push(record);
+  } else {
+    layerSteps[nextLayerStep] = record;
+  }
+  nextLayerStep = (nextLayerStep + 1) % LAYER_STEP_LIMIT;
+}
+
+// Nearest-rank percentile of an ascending array
+function percentile(sorted: number[], p: number): number | null {
+  if (sorted.length === 0) return null;
+  return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)];
+}
+
+function getLayerStats() {
+  const cutoff = Date.now() - HISTORY_WINDOW_MS;
+  const groups = new Map<string, LayerStepRecord[]>();
+  let since: number | null = null;
+  let steps = 0;
+  for (const record of layerSteps) {
+    if (record.at < cutoff) continue;
+    steps++;
+    if (since === null || record.at < since) since = record.at;
+    const key = `${record.endpoint}|${record.site}|${record.layer}`;
+    const group = groups.get(key);
+    if (group) group.push(record);
+    else groups.set(key, [record]);
+  }
+
+  const byEndpoint: Record<string, Record<string, Record<string, any>>> = {};
+  for (const [key, records] of groups) {
+    const [endpoint, site, layer] = key.split('|');
+    const counts: Record<StepResult, number> = { ok: 0, blocked: 0, empty: 0, http_error: 0, timeout: 0, error: 0 };
+    for (const record of records) counts[record.result]++;
+    const ms = records.map((r) => r.ms).sort((a, b) => a - b);
+    byEndpoint[endpoint] ??= {};
+    byEndpoint[endpoint][site] ??= {};
+    byEndpoint[endpoint][site][layer] = {
+      attempts: records.length,
+      ...counts,
+      okRate: Math.round((counts.ok / records.length) * 1000) / 1000,
+      p50Ms: percentile(ms, 0.5),
+      p95Ms: percentile(ms, 0.95),
+    };
+  }
+
+  return {
+    window: `last 24h, at most ${LAYER_STEP_LIMIT} steps`,
+    since,
+    steps,
+    brightDataFirst: Array.from(BRIGHTDATA_FIRST).filter((site) => BRIGHTDATA_TARGETS.includes(site)),
+    byEndpoint,
+  };
 }
 
 class Semaphore {
@@ -567,63 +740,71 @@ function extractRedfinMetadata(html: string): {
   };
 }
 
-async function scrapeWithBrightData(url: string): Promise<ScrapeResult> {
+async function scrapeWithBrightData(url: string, attempt: number, trace: RequestTrace): Promise<ScrapeResult> {
   if (!BRIGHTDATA_API_KEY) {
     throw new Error('BRIGHTDATA_API_KEY is not defined');
   }
 
   const target = getUrlTarget(url);
   const timeoutMs = target === 'realtor' ? 20000 : 25000;
+  const startedAt = Date.now();
 
-  console.log(`[Scraper] Querying Bright Data Web Unlocker for URL: ${url} (Timeout: ${timeoutMs / 1000}s)`);
-  const response = await fetch('https://api.brightdata.com/request', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`
-    },
-    body: JSON.stringify({
-      zone: BRIGHTDATA_ZONE,
-      url: url,
-      format: 'raw',
-      country: 'us'
-    }),
-    signal: AbortSignal.timeout(timeoutMs)
-  });
+  try {
+    console.log(`[Scraper] Querying Bright Data Web Unlocker for URL: ${url} (Timeout: ${timeoutMs / 1000}s)`);
+    const response = await fetch('https://api.brightdata.com/request', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`
+      },
+      body: JSON.stringify({
+        zone: BRIGHTDATA_ZONE,
+        url: url,
+        format: 'raw',
+        country: 'us'
+      }),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`[Scraper] Bright Data API returned status ${response.status}: ${errorText}`);
-    
-    if (response.status === 403 || response.status === 405 || response.status === 429 || response.status === 503) {
-      throw new TargetBlockedError(response.status, `Target page returned HTTP status ${response.status}`);
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[Scraper] Bright Data API returned status ${response.status}: ${errorText}`);
+
+      if (response.status === 403 || response.status === 405 || response.status === 429 || response.status === 503) {
+        throw new TargetBlockedError(response.status, `Target page returned HTTP status ${response.status}`);
+      }
+      throw new UpstreamStatusError(response.status, `Bright Data API request failed with status ${response.status}`);
     }
-    throw new Error(`Bright Data API request failed with status ${response.status}`);
-  }
 
-  const html = await response.text();
-  
-  if (isCaptchaOrBlockPage(html)) {
-    throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
-  }
+    const html = await response.text();
 
-  const photos = extractPhotosFromHtml(html);
-  if (photos.length === 0) {
-    throw new TargetBlockedError(429, 'Target page returned block page or no content');
-  }
+    if (isCaptchaOrBlockPage(html)) {
+      throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
+    }
 
-  console.log(`[Scraper] Bright Data Web Unlocker successful. Extracted ${photos.length} photos.`);
-  const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
-  return {
-    photos,
-    ...metadata
-  };
+    const photos = extractPhotosFromHtml(html);
+    if (photos.length === 0) {
+      throw new EmptyPageError('Target page returned block page or no content');
+    }
+
+    console.log(`[Scraper] Bright Data Web Unlocker successful. Extracted ${photos.length} photos.`);
+    const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
+    trace.record('brightdata', attempt, 'ok', startedAt);
+    return {
+      photos,
+      ...metadata
+    };
+  } catch (err) {
+    trace.recordError('brightdata', attempt, err, startedAt);
+    throw err;
+  }
 }
 
-async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>): Promise<ScrapeResult> {
+// Layer 1: Fast standalone HTTP GET via rotating proxy (~900ms). Null when it produced no photos.
+async function scrapeWithFastGet(url: string, attempt: number, options: Record<string, any>, trace: RequestTrace): Promise<ScrapeResult | null> {
   const target = getUrlTarget(url);
+  const startedAt = Date.now();
 
-  // Layer 1: Fast standalone HTTP GET via rotating proxy (~900ms)
   try {
     console.log(`[Scraper] Attempt ${attempt}: Layer 1 fast HTTP GET for URL: ${url}`);
     const cookieHeader = target === 'redfin' ? getRedfinCookieHeader() : undefined;
@@ -660,16 +841,20 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
           if (photos.length > 0) {
             console.log(`[Scraper] Attempt ${attempt}: Layer 1 successful in fast path. Extracted ${photos.length} photos.`);
             const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
+            trace.record('fast', attempt, 'ok', startedAt, { status });
             return {
               photos,
               ...metadata
             };
           }
+          trace.record('fast', attempt, 'empty', startedAt, { status });
         } else {
           console.log(`[Scraper] Attempt ${attempt}: Layer 1 hit captcha/block page.`);
+          trace.record('fast', attempt, 'blocked', startedAt, { status, detail: 'block page' });
         }
       } else {
         console.warn(`[Scraper] Attempt ${attempt}: Layer 1 returned HTTP status ${status}.`);
+        trace.record('fast', attempt, BLOCK_STATUSES.has(status) ? 'blocked' : 'http_error', startedAt, { status });
       }
     } finally {
       // Disposed on every path, a timeout included, so contexts don't pile up for the life of the process
@@ -677,28 +862,67 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
     }
   } catch (err: any) {
     console.warn(`[Scraper] Attempt ${attempt}: Layer 1 failed (${err.message}).`);
+    trace.recordError('fast', attempt, err, startedAt);
   }
+  return null;
+}
 
-  // Layer 2: Escalate to Bright Data Web Unlocker if configured (Guaranteed Fallback)
-  if ((target === 'zillow' || target === 'realtor' || target === 'homes' || target === 'redfin') && BRIGHTDATA_API_KEY) {
-    try {
-      console.log(`[Scraper] Attempt ${attempt}: Escalating to Layer 2 (Bright Data Web Unlocker) for ${url}`);
-      return await scrapeWithBrightData(url);
-    } catch (error) {
-      console.warn(`[Scraper] Bright Data Web Unlocker failed for ${url}: ${(error as Error).message}.`);
-      if (error instanceof TargetBlockedError) throw error;
+// Layer 2: Bright Data Web Unlocker. Its block ends the attempt without the browser; its other failures don't.
+async function tryBrightData(
+  url: string,
+  attempt: number,
+  trace: RequestTrace
+): Promise<{ result: ScrapeResult | null; block: TargetBlockedError | null }> {
+  try {
+    console.log(`[Scraper] Attempt ${attempt}: Trying Layer 2 (Bright Data Web Unlocker) for ${url}`);
+    return { result: await scrapeWithBrightData(url, attempt, trace), block: null };
+  } catch (error) {
+    console.warn(`[Scraper] Bright Data Web Unlocker failed for ${url}: ${(error as Error).message}.`);
+    return { result: null, block: error instanceof TargetBlockedError ? error : null };
+  }
+}
+
+async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>, trace: RequestTrace): Promise<ScrapeResult> {
+  const target = getUrlTarget(url);
+  let brightDataBlock: TargetBlockedError | null = null;
+
+  // Fast GET then Bright Data by default; BRIGHTDATA_FIRST swaps the two for the sites it names
+  if (usesBrightData(target) && BRIGHTDATA_FIRST.has(target)) {
+    const brightData = await tryBrightData(url, attempt, trace);
+    if (brightData.result) return brightData.result;
+    brightDataBlock = brightData.block;
+    const fast = await scrapeWithFastGet(url, attempt, options, trace);
+    if (fast) return fast;
+  } else {
+    const fast = await scrapeWithFastGet(url, attempt, options, trace);
+    if (fast) return fast;
+    if (usesBrightData(target)) {
+      const brightData = await tryBrightData(url, attempt, trace);
+      if (brightData.result) return brightData.result;
+      brightDataBlock = brightData.block;
     }
   }
 
-  // Layer 2: Launch browser & try browser-context request
+  // A block from Bright Data ends the attempt: the browser only runs when Bright Data failed some other way
+  if (brightDataBlock) throw brightDataBlock;
+
+  // Layer 3: Launch browser & try browser-context request
   console.log(`[Scraper] Attempt ${attempt}: Entering browser queue for URL: ${url}`);
+  const queueStart = Date.now();
   await browserSemaphore.acquire();
+  trace.record('browser_queue', attempt, 'ok', queueStart);
 
   try {
     console.log(`[Scraper] Attempt ${attempt}: Launching Camoufox browser for URL: ${url}`);
-    const browser = await Camoufox(options);
+    const launchStart = Date.now();
+    const browser = await Camoufox(options).catch((err) => {
+      trace.recordError('browser_launch', attempt, err, launchStart);
+      throw err;
+    });
+    trace.record('browser_launch', attempt, 'ok', launchStart);
 
     try {
+      const requestStart = Date.now();
       try {
         console.log(`[Scraper] Attempt ${attempt}: Attempting browser-context HTTP GET...`);
         const context = await browser.newContext();
@@ -726,101 +950,33 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
           if (photos.length > 0) {
             console.log(`[Scraper] Attempt ${attempt}: Browser-context HTTP GET successful. Extracted ${photos.length} photos.`);
             const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
+            trace.record('browser_request', attempt, 'ok', requestStart, { status });
             return {
               photos,
               ...metadata
             };
           }
+          trace.record('browser_request', attempt, 'empty', requestStart, { status });
         } else {
           await context.close();
+          trace.record('browser_request', attempt, 'http_error', requestStart, { status });
         }
       } catch (err) {
+        trace.recordError('browser_request', attempt, err, requestStart);
         if (err instanceof TargetBlockedError) throw err;
         console.warn(`[Scraper] Attempt ${attempt}: Browser-context HTTP GET failed or blocked: ${(err as Error).message}`);
       }
 
-      // Layer 3: Fallback to full browser page loading and rendering
-      console.log(`[Scraper] Attempt ${attempt}: Opening page tab for rendering...`);
-      const page = await browser.newPage();
-
-      // Block heavy resources (images, stylesheets, fonts, media) to save memory and bandwidth
-      await page.route('**/*', (route) => {
-        const type = route.request().resourceType();
-        if (['image', 'stylesheet', 'media', 'font'].includes(type)) {
-          route.abort();
-        } else {
-          route.continue();
-        }
-      });
-
-      // Navigate to listing page (with 7s timeout)
-      console.log(`[Scraper] Attempt ${attempt}: Navigating to page...`);
-      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 7000 });
-      const status = response?.status() ?? 0;
-      if (status === 405 || status === 403 || status === 429 || status === 503 || status >= 400) {
-        throw new TargetBlockedError(status >= 400 ? status : 429, `Target page returned HTTP status ${status}`);
-      }
-
-      const html = await page.content();
-      if (isCaptchaOrBlockPage(html)) {
-        throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
-      }
-
-      // Wait safely for navigation/rendering to settle
-      await page.waitForLoadState('domcontentloaded').catch(() => {});
-      await page.waitForTimeout(500);
-
-      console.log(`[Scraper] Attempt ${attempt}: Extracting page content...`);
-      let result: { scriptTexts: string[]; imgs: string[] } | null = null;
+      // Full browser page loading and rendering
+      const renderStart = Date.now();
       try {
-        result = await page.evaluate(() => {
-          const scriptTexts = Array.from(document.querySelectorAll('script'))
-            .map((s) => s.textContent || '');
-          const imgs = Array.from(document.images).map((img: HTMLImageElement) => img.src);
-          return { scriptTexts, imgs };
-        });
-      } catch (evalErr) {
-        console.warn(`[Scraper] Attempt ${attempt}: page.evaluate failed (${(evalErr as Error).message}). Extracting directly from html string.`);
+        const rendered = await renderListingPage(browser, url, attempt);
+        trace.record('browser_render', attempt, 'ok', renderStart);
+        return rendered;
+      } catch (err) {
+        trace.recordError('browser_render', attempt, err, renderStart);
+        throw err;
       }
-
-      const photos: string[] = [];
-
-      if (result) {
-        const fullText = result.scriptTexts.join('\n').replace(/\\\//g, '/');
-        
-        const redfinMatches = fullText.match(/https:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'>\\,;`]+/g) || [];
-        const zillowMatches = fullText.match(/https:\/\/photos\.zillowstatic\.com\/fp\/[^\s"'>\\,;`]+/g) || [];
-        const realtorMatches = fullText.match(/https:\/\/[a-z0-9-.]+\.rdcpix\.com\/[^\s"'>\\,;`]+/g) || [];
-
-        photos.push(...redfinMatches, ...zillowMatches, ...realtorMatches);
-
-        result.imgs.forEach((src: string) => {
-          if (!src) return;
-          if (src.includes('ssl.cdn-redfin.com') || src.includes('photos.zillowstatic.com') || src.includes('rdcpix.com')) {
-            photos.push(src);
-          }
-        });
-      }
-
-      // Fallback: also run extractPhotosFromHtml on raw html string
-      const htmlPhotos = extractPhotosFromHtml(html);
-      photos.push(...htmlPhotos);
-
-      // Clean, de-duplicate, and filter out tracking pixels
-      const cleaned = Array.from(new Set(photos)).filter(
-        p => !p.includes('pixel') && !p.includes('tracking')
-      );
-
-      if (cleaned.length === 0) {
-        throw new TargetBlockedError(429, 'Target page returned block page or no content');
-      }
-
-      console.log(`[Scraper] Attempt ${attempt}: Successfully extracted ${cleaned.length} photos.`);
-      const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
-      return {
-        photos: cleaned,
-        ...metadata
-      };
     } finally {
       console.log(`[Scraper] Attempt ${attempt}: Closing Camoufox browser.`);
       await browser.close();
@@ -829,6 +985,96 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
     browserSemaphore.release();
     console.log(`[Scraper] Attempt ${attempt}: Released browser queue for URL: ${url}`);
   }
+}
+
+// Loads the listing in a browser tab and reads photos from its scripts, images and HTML
+async function renderListingPage(
+  browser: Browser,
+  url: string,
+  attempt: number
+): Promise<ScrapeResult> {
+  const target = getUrlTarget(url);
+  console.log(`[Scraper] Attempt ${attempt}: Opening page tab for rendering...`);
+  const page = await browser.newPage();
+
+  // Block heavy resources (images, stylesheets, fonts, media) to save memory and bandwidth
+  await page.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    if (['image', 'stylesheet', 'media', 'font'].includes(type)) {
+      route.abort();
+    } else {
+      route.continue();
+    }
+  });
+
+  // Navigate to listing page (with 7s timeout)
+  console.log(`[Scraper] Attempt ${attempt}: Navigating to page...`);
+  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 7000 });
+  const status = response?.status() ?? 0;
+  if (status === 405 || status === 403 || status === 429 || status === 503 || status >= 400) {
+    throw new TargetBlockedError(status >= 400 ? status : 429, `Target page returned HTTP status ${status}`);
+  }
+
+  const html = await page.content();
+  if (isCaptchaOrBlockPage(html)) {
+    throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
+  }
+
+  // Wait safely for navigation/rendering to settle
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(500);
+
+  console.log(`[Scraper] Attempt ${attempt}: Extracting page content...`);
+  let result: { scriptTexts: string[]; imgs: string[] } | null = null;
+  try {
+    result = await page.evaluate(() => {
+      const scriptTexts = Array.from(document.querySelectorAll('script'))
+        .map((s) => s.textContent || '');
+      const imgs = Array.from(document.images).map((img: HTMLImageElement) => img.src);
+      return { scriptTexts, imgs };
+    });
+  } catch (evalErr) {
+    console.warn(`[Scraper] Attempt ${attempt}: page.evaluate failed (${(evalErr as Error).message}). Extracting directly from html string.`);
+  }
+
+  const photos: string[] = [];
+
+  if (result) {
+    const fullText = result.scriptTexts.join('\n').replace(/\\\//g, '/');
+    
+    const redfinMatches = fullText.match(/https:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'>\\,;`]+/g) || [];
+    const zillowMatches = fullText.match(/https:\/\/photos\.zillowstatic\.com\/fp\/[^\s"'>\\,;`]+/g) || [];
+    const realtorMatches = fullText.match(/https:\/\/[a-z0-9-.]+\.rdcpix\.com\/[^\s"'>\\,;`]+/g) || [];
+
+    photos.push(...redfinMatches, ...zillowMatches, ...realtorMatches);
+
+    result.imgs.forEach((src: string) => {
+      if (!src) return;
+      if (src.includes('ssl.cdn-redfin.com') || src.includes('photos.zillowstatic.com') || src.includes('rdcpix.com')) {
+        photos.push(src);
+      }
+    });
+  }
+
+  // Fallback: also run extractPhotosFromHtml on raw html string
+  const htmlPhotos = extractPhotosFromHtml(html);
+  photos.push(...htmlPhotos);
+
+  // Clean, de-duplicate, and filter out tracking pixels
+  const cleaned = Array.from(new Set(photos)).filter(
+    p => !p.includes('pixel') && !p.includes('tracking')
+  );
+
+  if (cleaned.length === 0) {
+    throw new EmptyPageError('Target page returned block page or no content');
+  }
+
+  console.log(`[Scraper] Attempt ${attempt}: Successfully extracted ${cleaned.length} photos.`);
+  const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
+  return {
+    photos: cleaned,
+    ...metadata
+  };
 }
 
 /**
@@ -849,7 +1095,7 @@ function isBlockOrTimeoutError(error: any): boolean {
   );
 }
 
-async function executeScrapeWithRetries(url: string, target: string): Promise<ScrapeResult> {
+async function executeScrapeWithRetries(url: string, target: string, trace: RequestTrace): Promise<ScrapeResult> {
   const circuit = checkCircuit(target);
 
   if (circuit === 'open') {
@@ -859,8 +1105,7 @@ async function executeScrapeWithRetries(url: string, target: string): Promise<Sc
   }
 
   // Redfin allowed 1 retry (max 2 attempts); BrightData allowed 1 attempt; others 3 attempts
-  const isBrightData = (target === 'zillow' || target === 'realtor' || target === 'homes' || target === 'redfin') && BRIGHTDATA_API_KEY;
-  const maxAttempts = (circuit === 'half-open' || isBrightData) ? 1 : (target === 'redfin' ? 2 : 3);
+  const maxAttempts = (circuit === 'half-open' || usesBrightData(target)) ? 1 : (target === 'redfin' ? 2 : 3);
   let lastError: Error | null = null;
   let hasRealBlock = false;
   const renderStartTime = Date.now();
@@ -872,7 +1117,7 @@ async function executeScrapeWithRetries(url: string, target: string): Promise<Sc
 
     const options = getLaunchOptionsForAttempt(attempt);
     try {
-      const result = await scrapePhotosAttempt(url, attempt, options);
+      const result = await scrapePhotosAttempt(url, attempt, options, trace);
       recordScrapeResult(url, true, false);
       updateCircuitOnSuccess(target);
       return result;
@@ -905,17 +1150,18 @@ async function executeScrapeWithRetries(url: string, target: string): Promise<Sc
   throw lastError || new TargetBlockedError(429, 'Target page returned block page or no content after retries');
 }
 
-async function scrapePhotos(url: string): Promise<ScrapeResult> {
+async function scrapePhotos(url: string, trace: RequestTrace): Promise<ScrapeResult> {
   const target = getUrlTarget(url);
   const startTime = Date.now();
 
   if (target === 'redfin') {
     await redfinSemaphore.acquire();
     await paceRedfinRequest();
+    trace.record('redfin_queue', 0, 'ok', startTime);
   }
 
   try {
-    return await executeScrapeWithRetries(url, target);
+    return await executeScrapeWithRetries(url, target, trace);
   } finally {
     if (target === 'redfin') {
       redfinSemaphore.release();
@@ -923,7 +1169,7 @@ async function scrapePhotos(url: string): Promise<ScrapeResult> {
   }
 }
 
-async function scrapePhotosWithTimeout(url: string): Promise<ScrapeResult> {
+async function scrapePhotosWithTimeout(url: string, trace: RequestTrace): Promise<ScrapeResult> {
   const QUEUE_WAIT_TIMEOUT_MS = 90000; // 90s budget for queue wait + pacing
   let timerId: NodeJS.Timeout;
 
@@ -934,7 +1180,7 @@ async function scrapePhotosWithTimeout(url: string): Promise<ScrapeResult> {
   });
 
   try {
-    return await Promise.race([scrapePhotos(url), timeoutPromise]);
+    return await Promise.race([scrapePhotos(url, trace), timeoutPromise]);
   } finally {
     clearTimeout(timerId!);
   }
@@ -961,14 +1207,21 @@ app.post('/scrape', async (req: Request, res: Response) => {
   if (!url) {
     return res.status(400).json({ error: 'Missing parameter "url" in request body.' });
   }
+  if (typeof url !== 'string') {
+    return res.status(400).json({ error: 'Parameter "url" must be a string.' });
+  }
 
+  const trace = new RequestTrace('/scrape', url, getUrlTarget(url));
   try {
-    const result = await scrapePhotosWithTimeout(url);
+    const result = await scrapePhotosWithTimeout(url, trace);
+    trace.photos = result.photos.length;
     res.json(result);
   } catch (error) {
     console.error(`[Scraper] Scrape failed for ${url}:`, error);
+    trace.error = errorDetail(error);
 
     if (error instanceof CircuitOpenError) {
+      trace.reason = 'circuit_open';
       res.statusMessage = error.message;
       res.status(429).json({
         error: error.message,
@@ -976,6 +1229,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
         status: 429
       });
     } else if (error instanceof TargetBlockedError) {
+      trace.reason = 'target_blocked';
       res.statusMessage = toStatusMessage(error.message);
       res.status(error.status).json({
         error: error.message,
@@ -983,11 +1237,14 @@ app.post('/scrape', async (req: Request, res: Response) => {
         status: error.status
       });
     } else {
+      trace.reason = 'resolver_error';
       res.status(500).json({
         error: (error as Error).message,
         reason: 'resolver_error'
       });
     }
+  } finally {
+    trace.log(res.statusCode);
   }
 });
 
@@ -1012,11 +1269,12 @@ interface FetchResult {
 }
 
 let cachedRedfinCookies: Map<string, string> = new Map();
-let warmingPromise: Promise<void> | null = null;
+let warmingPromise: Promise<Error | null> | null = null;
 let lastCookieWarmTime = 0;
 const COOKIE_MAX_AGE_MS = 20 * 60 * 1000; // 20 minutes
 
-async function warmRedfinCookies(): Promise<void> {
+// Resolves to null when this warm received an aws-waf-token, or to the reason it didn't
+async function warmRedfinCookies(): Promise<Error | null> {
   if (warmingPromise) {
     return warmingPromise;
   }
@@ -1031,15 +1289,19 @@ async function warmRedfinCookies(): Promise<void> {
       await page.goto('https://www.redfin.com', { waitUntil: 'networkidle' });
       await page.waitForTimeout(2500);
       const cookies = await context.cookies();
+      let receivedToken = false;
       for (const cookie of cookies) {
         if (cookie.domain.includes('redfin.com')) {
           cachedRedfinCookies.set(cookie.name, cookie.value);
+          if (cookie.name === 'aws-waf-token') receivedToken = true;
         }
       }
       lastCookieWarmTime = Date.now();
       console.log(`[Fetcher] Successfully warmed Redfin cookies (${cachedRedfinCookies.size} cookies cached, aws-waf-token: ${cachedRedfinCookies.has('aws-waf-token')})`);
+      return receivedToken ? null : new Error('Warm finished without an aws-waf-token cookie');
     } catch (err) {
       console.error('[Fetcher] Error warming Redfin cookies:', err);
+      return err instanceof Error ? err : new Error(String(err));
     } finally {
       if (browser) {
         await browser.close().catch(() => {});
@@ -1048,6 +1310,13 @@ async function warmRedfinCookies(): Promise<void> {
     }
   })();
   return warmingPromise;
+}
+
+async function warmRedfinCookiesTraced(trace: RequestTrace, attempt: number): Promise<void> {
+  const startedAt = Date.now();
+  const failure = await warmRedfinCookies();
+  if (failure) trace.recordError('cookie_warm', attempt, failure, startedAt);
+  else trace.record('cookie_warm', attempt, 'ok', startedAt);
 }
 
 function updateRedfinCookies(setCookieHeader?: string) {
@@ -1071,81 +1340,90 @@ function getRedfinCookieHeader(): string | undefined {
     .join('; ');
 }
 
-async function fetchWithBrightData(url: string): Promise<FetchResult> {
+async function fetchWithBrightData(url: string, trace: RequestTrace, attempt: number): Promise<FetchResult> {
   if (!BRIGHTDATA_API_KEY) {
     throw new Error('BRIGHTDATA_API_KEY is not defined');
   }
 
   const timeoutMs = 25000;
-  console.log(`[Fetcher] Querying Bright Data Web Unlocker for URL: ${url}`);
-  const response = await fetch('https://api.brightdata.com/request', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`
-    },
-    body: JSON.stringify({
-      zone: BRIGHTDATA_ZONE,
-      url: url,
-      format: 'raw',
-      country: 'us'
-    }),
-    signal: AbortSignal.timeout(timeoutMs)
-  });
+  const startedAt = Date.now();
+  try {
+    console.log(`[Fetcher] Querying Bright Data Web Unlocker for URL: ${url}`);
+    const response = await fetch('https://api.brightdata.com/request', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`
+      },
+      body: JSON.stringify({
+        zone: BRIGHTDATA_ZONE,
+        url: url,
+        format: 'raw',
+        country: 'us'
+      }),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`[Fetcher] Bright Data API returned status ${response.status}: ${errorText}`);
-    if (response.status === 403 || response.status === 405 || response.status === 429 || response.status === 503) {
-      throw new TargetBlockedError(response.status, `Target page returned HTTP status ${response.status}`);
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[Fetcher] Bright Data API returned status ${response.status}: ${errorText}`);
+      if (response.status === 403 || response.status === 405 || response.status === 429 || response.status === 503) {
+        throw new TargetBlockedError(response.status, `Target page returned HTTP status ${response.status}`);
+      }
+      throw new UpstreamStatusError(response.status, `Bright Data API request failed with status ${response.status}`);
     }
-    throw new Error(`Bright Data API request failed with status ${response.status}`);
-  }
 
-  const text = await response.text();
-  if (isCaptchaOrBlockPage(text)) {
-    throw new TargetBlockedError(429, 'Target page returned block page');
-  }
+    const text = await response.text();
+    if (isCaptchaOrBlockPage(text)) {
+      throw new TargetBlockedError(429, 'Target page returned block page');
+    }
 
-  const parsedUrl = new URL(url);
-  if (parsedUrl.pathname.startsWith('/zipcode/')) {
-    const match = text.match(/\/stingray\/api\/gis\?[^"'\s<>]+/);
-    let region_id: string | null = null;
-    let region_type: string | null = null;
-    let market: string | null = null;
-    if (match) {
-      try {
-        const u = new URL('https://www.redfin.com' + match[0].replace(/&amp;/g, '&'));
-        region_id = u.searchParams.get('region_id');
-        region_type = u.searchParams.get('region_type');
-        market = u.searchParams.get('market');
-      } catch (e) {}
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname.startsWith('/zipcode/')) {
+      const match = text.match(/\/stingray\/api\/gis\?[^"'\s<>]+/);
+      let region_id: string | null = null;
+      let region_type: string | null = null;
+      let market: string | null = null;
+      if (match) {
+        try {
+          const u = new URL('https://www.redfin.com' + match[0].replace(/&amp;/g, '&'));
+          region_id = u.searchParams.get('region_id');
+          region_type = u.searchParams.get('region_type');
+          market = u.searchParams.get('market');
+        } catch (e) {}
+      }
+      if (!region_id) {
+        throw new Error('Redfin region id not found on zipcode page');
+      }
+      const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
+      recordScrapeResult(url, true, false);
+      updateCircuitOnSuccess('redfin');
+      trace.record('brightdata', attempt, 'ok', startedAt);
+      return {
+        status: 200,
+        data: {
+          region_id,
+          region_type: region_type || '2',
+          market,
+          title: titleMatch ? titleMatch[1] : 'Redfin Zipcode',
+          url: url
+        }
+      };
     }
-    if (!region_id) {
-      throw new Error('Redfin region id not found on zipcode page');
-    }
-    const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
+
     recordScrapeResult(url, true, false);
     updateCircuitOnSuccess('redfin');
-    return {
-      status: 200,
-      data: {
-        region_id,
-        region_type: region_type || '2',
-        market,
-        title: titleMatch ? titleMatch[1] : 'Redfin Zipcode',
-        url: url
-      }
-    };
+    trace.record('brightdata', attempt, 'ok', startedAt);
+    return { status: 200, body: text };
+  } catch (err) {
+    trace.recordError('brightdata', attempt, err, startedAt);
+    throw err;
   }
-
-  recordScrapeResult(url, true, false);
-  updateCircuitOnSuccess('redfin');
-  return { status: 200, body: text };
 }
 
-async function renderZipcodePage(url: string): Promise<FetchResult> {
+async function renderZipcodePage(url: string, trace: RequestTrace): Promise<FetchResult> {
   let browser;
+  const startedAt = Date.now();
   try {
     const options = getLaunchOptionsForAttempt(1);
     browser = await Camoufox(options);
@@ -1192,18 +1470,20 @@ async function renderZipcodePage(url: string): Promise<FetchResult> {
 
     recordScrapeResult(url, true, false);
     updateCircuitOnSuccess('redfin');
+    trace.record('browser', 1, 'ok', startedAt);
     return {
       status: 200,
       data: extracted
     };
   } catch (err: any) {
+    trace.recordError('browser', 1, err, startedAt);
     if (browser) {
       await browser.close().catch(() => {});
       browser = undefined;
     }
     if (BRIGHTDATA_API_KEY) {
       console.warn(`[Fetcher] Camoufox failed for ${url} (${err.message}). Escalating to Bright Data Web Unlocker...`);
-      return await fetchWithBrightData(url);
+      return await fetchWithBrightData(url, trace, 1);
     }
     throw err;
   } finally {
@@ -1211,14 +1491,15 @@ async function renderZipcodePage(url: string): Promise<FetchResult> {
   }
 }
 
-async function executeFetchRequest(url: string, retryOnBlock: boolean = true): Promise<FetchResult> {
+async function executeFetchRequest(url: string, trace: RequestTrace, retryOnBlock: boolean = true): Promise<FetchResult> {
   const parsed = new URL(url);
   if (parsed.pathname.startsWith('/zipcode/')) {
-    return await renderZipcodePage(url);
+    return await renderZipcodePage(url, trace);
   }
 
+  const attempt = retryOnBlock ? 1 : 2;
   if (!cachedRedfinCookies.has('aws-waf-token') || Date.now() - lastCookieWarmTime > COOKIE_MAX_AGE_MS) {
-    await warmRedfinCookies();
+    await warmRedfinCookiesTraced(trace, attempt);
   }
 
   const options = getLaunchOptionsForAttempt(1);
@@ -1228,6 +1509,8 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
   let requestContext;
   // Set once the request is passed to the retry or to Bright Data, so the catch below doesn't escalate their errors again
   let handedOff = false;
+  const fastStart = Date.now();
+  let fastRecorded = false;
   try {
     const cookieHeader = getRedfinCookieHeader();
     const extraHeaders: Record<string, string> = {
@@ -1263,19 +1546,25 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
       finalUrl.includes('ratelimited.redfin.com') ||
       isCaptchaOrBlockPage(text)
     ) {
+      trace.record('fast', attempt, 'blocked', fastStart, {
+        status,
+        detail: finalUrl.includes('ratelimited.redfin.com') ? 'ratelimited redirect' : isCaptchaOrBlockPage(text) ? 'block page' : undefined,
+      });
+      fastRecorded = true;
+
       if (retryOnBlock) {
         console.warn(`[Fetcher] Request blocked with status ${status}, re-warming Camoufox session cookies and retrying...`);
         handedOff = true;
         cachedRedfinCookies.delete('aws-waf-token');
-        await warmRedfinCookies();
-        return await executeFetchRequest(url, false);
+        await warmRedfinCookiesTraced(trace, attempt);
+        return await executeFetchRequest(url, trace, false);
       }
 
       // Layer 2: Escalate to Bright Data Web Unlocker if configured
       if (BRIGHTDATA_API_KEY) {
         console.warn(`[Fetcher] Layer 1 blocked with status ${status}. Escalating to Layer 2: Bright Data Web Unlocker...`);
         handedOff = true;
-        return await fetchWithBrightData(url);
+        return await fetchWithBrightData(url, trace, attempt);
       }
 
       console.warn(`[Fetcher] Target blocked with status ${status}, url: ${finalUrl}`);
@@ -1284,10 +1573,13 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
       throw new TargetBlockedError(429, `Target page returned HTTP status ${status}`);
     }
 
+    trace.record('fast', attempt, status >= 200 && status < 300 ? 'ok' : 'http_error', fastStart, { status });
+    fastRecorded = true;
     recordScrapeResult(url, true, false);
     updateCircuitOnSuccess('redfin');
     return { status, body: text };
   } catch (err: any) {
+    if (!fastRecorded) trace.recordError('fast', attempt, err, fastStart);
     if (requestContext) {
       await requestContext.dispose().catch(() => {});
     }
@@ -1295,7 +1587,7 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
     if (BRIGHTDATA_API_KEY && !handedOff && !(err instanceof CircuitOpenError)) {
       console.warn(`[Fetcher] Layer 1 error (${err.message}). Escalating to Layer 2: Bright Data Web Unlocker...`);
       try {
-        return await fetchWithBrightData(url);
+        return await fetchWithBrightData(url, trace, attempt);
       } catch (fallbackErr: any) {
         console.error(`[Fetcher] Layer 2 Web Unlocker also failed:`, fallbackErr.message);
         if (fallbackErr instanceof TargetBlockedError) throw fallbackErr;
@@ -1313,7 +1605,7 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
   }
 }
 
-async function fetchRedfinWithQueue(url: string): Promise<FetchResult> {
+async function fetchRedfinWithQueue(url: string, trace: RequestTrace): Promise<FetchResult> {
   const circuit = checkCircuit('redfin');
   if (circuit === 'open') {
     console.log(`[Circuit Breaker] Skipping fetch for ${url} (Circuit is OPEN).`);
@@ -1331,10 +1623,12 @@ async function fetchRedfinWithQueue(url: string): Promise<FetchResult> {
   });
 
   const worker = async () => {
+    const queueStart = Date.now();
     await redfinSemaphore.acquire();
     try {
       await paceRedfinRequest();
-      return await executeFetchRequest(url);
+      trace.record('redfin_queue', 0, 'ok', queueStart);
+      return await executeFetchRequest(url, trace);
     } finally {
       redfinSemaphore.release();
     }
@@ -1363,8 +1657,9 @@ app.post('/fetch', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'url not allowed', reason: 'not_allowed' });
   }
 
+  const trace = new RequestTrace('/fetch', url, 'redfin');
   try {
-    const result = await fetchRedfinWithQueue(url);
+    const result = await fetchRedfinWithQueue(url, trace);
     let data: any = result.data;
     if (!data && result.body) {
       let cleaned = result.body.trim();
@@ -1380,8 +1675,10 @@ app.post('/fetch', async (req: Request, res: Response) => {
     return res.status(200).json({ status: 200, data });
   } catch (error) {
     console.error(`[Fetcher] Fetch failed for ${url}:`, error);
+    trace.error = errorDetail(error);
 
     if (error instanceof CircuitOpenError) {
+      trace.reason = 'circuit_open';
       res.statusMessage = error.message;
       res.status(429).json({
         error: error.message,
@@ -1389,6 +1686,7 @@ app.post('/fetch', async (req: Request, res: Response) => {
         status: 429
       });
     } else if (error instanceof TargetBlockedError) {
+      trace.reason = 'target_blocked';
       res.statusMessage = toStatusMessage(error.message);
       res.status(error.status || 429).json({
         error: error.message,
@@ -1396,15 +1694,19 @@ app.post('/fetch', async (req: Request, res: Response) => {
         status: error.status || 429
       });
     } else if (error instanceof FetchTimeoutError) {
+      trace.reason = 'timeout';
       res.status(504).json({
         reason: 'timeout'
       });
     } else {
+      trace.reason = 'resolver_error';
       res.status(500).json({
         error: (error as Error).message,
         reason: 'resolver_error'
       });
     }
+  } finally {
+    trace.log(res.statusCode);
   }
 });
 
@@ -1426,6 +1728,7 @@ app.get('/health', (_req: Request, res: Response) => {
     status: deriveStatus(),
     uptime: process.uptime(),
     stats: formattedStats,
+    layers: getLayerStats(),
   });
 });
 
