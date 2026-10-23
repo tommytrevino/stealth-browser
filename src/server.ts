@@ -937,6 +937,12 @@ async function scrapePhotosWithTimeout(url: string): Promise<ScrapeResult> {
   }
 }
 
+// Node throws on a status message containing newlines or non-ASCII (Playwright error
+// messages contain both), which crashes the process, so only the first line is used
+function toStatusMessage(message: string): string {
+  return message.split('\n')[0].replace(/[^\x20-\x7e]/g, '').trim();
+}
+
 // Scrape API endpoint
 app.post('/scrape', async (req: Request, res: Response) => {
   // Simple Authorization header check
@@ -967,7 +973,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
         status: 429
       });
     } else if (error instanceof TargetBlockedError) {
-      res.statusMessage = error.message;
+      res.statusMessage = toStatusMessage(error.message);
       res.status(error.status).json({
         error: error.message,
         reason: 'target_blocked',
@@ -1098,9 +1104,6 @@ async function fetchWithBrightData(url: string): Promise<FetchResult> {
     throw new TargetBlockedError(429, 'Target page returned block page');
   }
 
-  recordScrapeResult(url, true, false);
-  updateCircuitOnSuccess('redfin');
-
   const parsedUrl = new URL(url);
   if (parsedUrl.pathname.startsWith('/zipcode/')) {
     const match = text.match(/\/stingray\/api\/gis\?[^"'\s<>]+/);
@@ -1115,19 +1118,26 @@ async function fetchWithBrightData(url: string): Promise<FetchResult> {
         market = u.searchParams.get('market');
       } catch (e) {}
     }
+    if (!region_id) {
+      throw new Error('Redfin region id not found on zipcode page');
+    }
     const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
+    recordScrapeResult(url, true, false);
+    updateCircuitOnSuccess('redfin');
     return {
       status: 200,
       data: {
-        region_id: region_id || '32257',
+        region_id,
         region_type: region_type || '2',
-        market: market || 'dallas',
+        market,
         title: titleMatch ? titleMatch[1] : 'Redfin Zipcode',
         url: url
       }
     };
   }
 
+  recordScrapeResult(url, true, false);
+  updateCircuitOnSuccess('redfin');
   return { status: 200, body: text };
 }
 
@@ -1165,13 +1175,17 @@ async function renderZipcodePage(url: string): Promise<FetchResult> {
         } catch (e) {}
       }
       return {
-        region_id: region_id || '32257',
+        region_id,
         region_type: region_type || '2',
-        market: market || 'dallas',
+        market,
         title: document.title,
         url: window.location.href
       };
     });
+
+    if (!extracted.region_id) {
+      throw new Error('Redfin region id not found on zipcode page');
+    }
 
     recordScrapeResult(url, true, false);
     updateCircuitOnSuccess('redfin');
@@ -1209,6 +1223,8 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
 
   console.log(`[Fetcher] Executing proxied fetch for URL: ${url}`);
   let requestContext;
+  // Set once the request is passed to the retry or to Bright Data, so the catch below doesn't escalate their errors again
+  let handedOff = false;
   try {
     const cookieHeader = getRedfinCookieHeader();
     const extraHeaders: Record<string, string> = {
@@ -1246,6 +1262,7 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
     ) {
       if (retryOnBlock) {
         console.warn(`[Fetcher] Request blocked with status ${status}, re-warming Camoufox session cookies and retrying...`);
+        handedOff = true;
         cachedRedfinCookies.delete('aws-waf-token');
         await warmRedfinCookies();
         return await executeFetchRequest(url, false);
@@ -1254,6 +1271,7 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
       // Layer 2: Escalate to Bright Data Web Unlocker if configured
       if (BRIGHTDATA_API_KEY) {
         console.warn(`[Fetcher] Layer 1 blocked with status ${status}. Escalating to Layer 2: Bright Data Web Unlocker...`);
+        handedOff = true;
         return await fetchWithBrightData(url);
       }
 
@@ -1271,7 +1289,7 @@ async function executeFetchRequest(url: string, retryOnBlock: boolean = true): P
       await requestContext.dispose().catch(() => {});
     }
     // Layer 2: Escalate to Bright Data Web Unlocker on Layer 1 errors
-    if (BRIGHTDATA_API_KEY && !(err instanceof CircuitOpenError)) {
+    if (BRIGHTDATA_API_KEY && !handedOff && !(err instanceof CircuitOpenError)) {
       console.warn(`[Fetcher] Layer 1 error (${err.message}). Escalating to Layer 2: Bright Data Web Unlocker...`);
       try {
         return await fetchWithBrightData(url);
@@ -1368,7 +1386,7 @@ app.post('/fetch', async (req: Request, res: Response) => {
         status: 429
       });
     } else if (error instanceof TargetBlockedError) {
-      res.statusMessage = error.message;
+      res.statusMessage = toStatusMessage(error.message);
       res.status(error.status || 429).json({
         error: error.message,
         reason: 'target_blocked',
