@@ -103,6 +103,30 @@ class UpstreamStatusError extends Error {
   }
 }
 
+// Bright Data answered 200, but with its own refusal in place of the page
+class BrightDataRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BrightDataRefusalError';
+  }
+}
+
+// Redfin answered /fetch with a body that isn't its JSON: no answer, rather than an empty one
+class InvalidResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidResponseError';
+  }
+}
+
+// Seen 2026-10-24 for every Redfin /stingray/ URL, on a zone without KYC: "Residential Failed (bad_endpoint): Requested
+// site is not available for immediate residential (no KYC) access mode in accordance with robots.txt. ..."
+function brightDataRefusal(body: string): BrightDataRefusalError | null {
+  const text = body.trimStart();
+  if (!text.startsWith('Residential Failed (')) return null;
+  return new BrightDataRefusalError(`Bright Data refused the URL: ${text.split('\n')[0].slice(0, 160)}`);
+}
+
 interface ScrapeRecord {
   timestamp: number;
   target: string;
@@ -783,6 +807,9 @@ async function scrapeWithBrightData(url: string, attempt: number, trace: Request
 
     const html = await response.text();
 
+    const refusal = brightDataRefusal(html);
+    if (refusal) throw refusal;
+
     if (isCaptchaOrBlockPage(html)) {
       throw new TargetBlockedError(429, 'Target page returned HTTP status 429');
     }
@@ -1270,11 +1297,9 @@ function isAllowedFetchUrl(urlStr: string): boolean {
 
 interface FetchResult {
   status: number;
-  body?: string;
-  data?: any;
+  data: any;
 }
 
-const COOKIE_MAX_AGE_MS = 20 * 60 * 1000; // without Bright Data, a token older than this is refreshed before use
 const COOKIE_REFRESH_AHEAD_MS = 15 * 60 * 1000; // past this age, a request starts a background refresh
 const COOKIE_TOKEN_WAIT_MS = 10 * 1000; // how long a refresh waits for aws-waf-token once the page has loaded
 const COOKIE_REFRESH_BACKOFF_BASE_MS = 30 * 1000; // doubles with each failure, up to the max
@@ -1310,12 +1335,6 @@ class RedfinSession {
   needsRefreshSoon(): boolean {
     const age = this.tokenAgeMs();
     return age === null || age > COOKIE_REFRESH_AHEAD_MS;
-  }
-
-  // No token, or too old to use without refreshing first
-  isStale(): boolean {
-    const age = this.tokenAgeMs();
-    return age === null || age > COOKIE_MAX_AGE_MS;
   }
 
   // A request got through to Redfin, so refreshing is working again
@@ -1448,7 +1467,7 @@ class RedfinSession {
 
 const redfinSession = new RedfinSession();
 
-// A request waiting on a refresh (only without Bright Data); the refresh itself is logged as cookie_refresh
+// A /fetch request waiting on a refresh, with no token or after a block; the refresh itself is logged as cookie_refresh
 async function waitForCookieRefresh(trace: RequestTrace, attempt: number): Promise<void> {
   const startedAt = Date.now();
   const failure = await redfinSession.refresh();
@@ -1456,7 +1475,8 @@ async function waitForCookieRefresh(trace: RequestTrace, attempt: number): Promi
   else trace.record('cookie_wait', attempt, 'ok', startedAt);
 }
 
-async function fetchWithBrightData(url: string, trace: RequestTrace, attempt: number): Promise<FetchResult> {
+// A /zipcode/ page, after the browser failed. Not used for /stingray/: Bright Data refuses those (see brightDataRefusal).
+async function fetchZipcodeWithBrightData(url: string, trace: RequestTrace, attempt: number): Promise<FetchResult> {
   if (!BRIGHTDATA_API_KEY) {
     throw new Error('BRIGHTDATA_API_KEY is not defined');
   }
@@ -1490,47 +1510,41 @@ async function fetchWithBrightData(url: string, trace: RequestTrace, attempt: nu
     }
 
     const text = await response.text();
+    const refusal = brightDataRefusal(text);
+    if (refusal) throw refusal;
     if (isCaptchaOrBlockPage(text)) {
       throw new TargetBlockedError(429, 'Target page returned block page');
     }
 
-    const parsedUrl = new URL(url);
-    if (parsedUrl.pathname.startsWith('/zipcode/')) {
-      const match = text.match(/\/stingray\/api\/gis\?[^"'\s<>]+/);
-      let region_id: string | null = null;
-      let region_type: string | null = null;
-      let market: string | null = null;
-      if (match) {
-        try {
-          const u = new URL('https://www.redfin.com' + match[0].replace(/&amp;/g, '&'));
-          region_id = u.searchParams.get('region_id');
-          region_type = u.searchParams.get('region_type');
-          market = u.searchParams.get('market');
-        } catch (e) {}
-      }
-      if (!region_id) {
-        throw new Error('Redfin region id not found on zipcode page');
-      }
-      const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
-      recordScrapeResult(url, true, false);
-      updateCircuitOnSuccess('redfin');
-      trace.record('brightdata', attempt, 'ok', startedAt);
-      return {
-        status: 200,
-        data: {
-          region_id,
-          region_type: region_type || '2',
-          market,
-          title: titleMatch ? titleMatch[1] : 'Redfin Zipcode',
-          url: url
-        }
-      };
+    const match = text.match(/\/stingray\/api\/gis\?[^"'\s<>]+/);
+    let region_id: string | null = null;
+    let region_type: string | null = null;
+    let market: string | null = null;
+    if (match) {
+      try {
+        const u = new URL('https://www.redfin.com' + match[0].replace(/&amp;/g, '&'));
+        region_id = u.searchParams.get('region_id');
+        region_type = u.searchParams.get('region_type');
+        market = u.searchParams.get('market');
+      } catch (e) {}
     }
-
+    if (!region_id) {
+      throw new Error('Redfin region id not found on zipcode page');
+    }
+    const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
     recordScrapeResult(url, true, false);
     updateCircuitOnSuccess('redfin');
     trace.record('brightdata', attempt, 'ok', startedAt);
-    return { status: 200, body: text };
+    return {
+      status: 200,
+      data: {
+        region_id,
+        region_type: region_type || '2',
+        market,
+        title: titleMatch ? titleMatch[1] : 'Redfin Zipcode',
+        url: url
+      }
+    };
   } catch (err) {
     trace.recordError('brightdata', attempt, err, startedAt);
     throw err;
@@ -1593,7 +1607,7 @@ async function renderZipcodePage(url: string, trace: RequestTrace): Promise<Fetc
     }
     if (BRIGHTDATA_API_KEY) {
       console.warn(`[Fetcher] Camoufox failed for ${url} (${err.message}). Escalating to Bright Data Web Unlocker...`);
-      return await fetchWithBrightData(url, trace, 1);
+      return await fetchZipcodeWithBrightData(url, trace, 1);
     }
     throw err;
   } finally {
@@ -1601,7 +1615,7 @@ async function renderZipcodePage(url: string, trace: RequestTrace): Promise<Fetc
   }
 }
 
-// Layer 1 for /fetch: the Redfin request itself, through the proxy with the session's cookies
+// The /fetch request to Redfin, through the proxy with the session's cookies
 async function fetchRedfinDirect(
   url: string,
   trace: RequestTrace,
@@ -1646,8 +1660,17 @@ async function fetchRedfinDirect(
       return { kind: 'blocked', status, finalUrl };
     }
 
+    let data: unknown;
+    try {
+      data = JSON.parse(text.trim().replace(/^\{\}&&/, ''));
+    } catch {
+      const err = new InvalidResponseError(`Redfin answered HTTP ${status} with a body that isn't JSON`);
+      trace.recordError('fast', attempt, err, startedAt, { status, tokenAgeMs });
+      return { kind: 'error', err };
+    }
+
     trace.record('fast', attempt, status >= 200 && status < 300 ? 'ok' : 'http_error', startedAt, { status, tokenAgeMs });
-    return { kind: 'ok', result: { status, body: text } };
+    return { kind: 'ok', result: { status, data } };
   } catch (err) {
     trace.recordError('fast', attempt, err, startedAt, { tokenAgeMs });
     return { kind: 'error', err };
@@ -1656,20 +1679,18 @@ async function fetchRedfinDirect(
   }
 }
 
+// Redfin directly, never Bright Data: it refuses every /stingray/ URL (see brightDataRefusal)
 async function fetchRedfinLayers(url: string, trace: RequestTrace, retryOnBlock: boolean): Promise<FetchResult> {
   const attempt = retryOnBlock ? 1 : 2;
   let refreshedNow = false;
 
-  if (BRIGHTDATA_API_KEY) {
-    // Never wait on a browser: the cookie refreshes in the background, and Bright Data answers until it arrives
-    if (redfinSession.needsRefreshSoon()) redfinSession.refreshInBackground();
-    if (!redfinSession.hasToken()) {
-      trace.notes.push('no Redfin WAF token yet, so straight to Bright Data');
-      return await fetchWithBrightData(url, trace, attempt);
-    }
-  } else if (retryOnBlock && redfinSession.isStale()) {
+  if (retryOnBlock && !redfinSession.hasToken()) {
     await waitForCookieRefresh(trace, attempt);
     refreshedNow = true;
+  } else if (redfinSession.needsRefreshSoon()) {
+    // An old token is used as it is, since one past 20 minutes still got through 8 of 10 times in production
+    // (2026-10-23/24); the refresh runs alongside, and a block still refreshes and retries below
+    redfinSession.refreshInBackground();
   }
 
   const direct = await fetchRedfinDirect(url, trace, attempt);
@@ -1682,30 +1703,13 @@ async function fetchRedfinLayers(url: string, trace: RequestTrace, retryOnBlock:
   }
 
   if (direct.kind === 'error') {
-    // Layer 2: Escalate to Bright Data Web Unlocker on Layer 1 errors
-    if (BRIGHTDATA_API_KEY) {
-      console.warn(`[Fetcher] Layer 1 error (${(direct.err as Error)?.message}). Escalating to Layer 2: Bright Data Web Unlocker...`);
-      try {
-        return await fetchWithBrightData(url, trace, attempt);
-      } catch (fallbackErr: any) {
-        console.error(`[Fetcher] Layer 2 Web Unlocker also failed:`, fallbackErr.message);
-        if (fallbackErr instanceof TargetBlockedError) throw fallbackErr;
-      }
-    }
     throw direct.err;
   }
 
   // Blocked: the token didn't get us in
   redfinSession.invalidateToken();
 
-  // Layer 2: Escalate to Bright Data Web Unlocker if configured
-  if (BRIGHTDATA_API_KEY) {
-    console.warn(`[Fetcher] Layer 1 blocked with status ${direct.status}. Refreshing cookies in the background; escalating to Layer 2: Bright Data Web Unlocker...`);
-    redfinSession.refreshInBackground();
-    return await fetchWithBrightData(url, trace, attempt);
-  }
-
-  // Without Bright Data, one refresh per request at most: retry only if this request hasn't refreshed yet
+  // One refresh per request at most: retry only if this request hasn't refreshed yet
   if (retryOnBlock && !refreshedNow) {
     console.warn(`[Fetcher] Request blocked with status ${direct.status}, re-warming Camoufox session cookies and retrying...`);
     await waitForCookieRefresh(trace, attempt);
@@ -1718,9 +1722,9 @@ async function fetchRedfinLayers(url: string, trace: RequestTrace, retryOnBlock:
   throw new TargetBlockedError(429, `Target page returned HTTP status ${direct.status}`);
 }
 
-// Errors leave /fetch as a block, an open circuit, a timeout, or as they are
+// Errors leave /fetch as a block, an open circuit, a timeout, an invalid response, or as they are
 function toFetchError(err: any, url: string): unknown {
-  if (err instanceof TargetBlockedError || err instanceof CircuitOpenError || err instanceof FetchTimeoutError) {
+  if (err instanceof TargetBlockedError || err instanceof CircuitOpenError || err instanceof FetchTimeoutError || err instanceof InvalidResponseError) {
     return err;
   }
   const msg = err?.message?.toLowerCase() || '';
@@ -1799,19 +1803,7 @@ app.post('/fetch', async (req: Request, res: Response) => {
   const trace = new RequestTrace('/fetch', url, 'redfin');
   try {
     const result = await fetchRedfinWithQueue(url, trace);
-    let data: any = result.data;
-    if (!data && result.body) {
-      let cleaned = result.body.trim();
-      if (cleaned.startsWith('{}&&')) {
-        cleaned = cleaned.substring(4);
-      }
-      try {
-        data = JSON.parse(cleaned);
-      } catch {
-        data = result.body;
-      }
-    }
-    return res.status(200).json({ status: 200, data });
+    return res.status(200).json({ status: 200, data: result.data });
   } catch (error) {
     console.error(`[Fetcher] Fetch failed for ${url}:`, error);
     trace.error = errorDetail(error);
@@ -1836,6 +1828,13 @@ app.post('/fetch', async (req: Request, res: Response) => {
       trace.reason = 'timeout';
       res.status(504).json({
         reason: 'timeout'
+      });
+    } else if (error instanceof InvalidResponseError) {
+      trace.reason = 'invalid_response';
+      res.status(502).json({
+        error: error.message,
+        reason: 'invalid_response',
+        status: 502
       });
     } else {
       trace.reason = 'resolver_error';
