@@ -119,6 +119,19 @@ class InvalidResponseError extends Error {
   }
 }
 
+// The proxy refused to connect. Playwright reports a refused CONNECT as an HTTP 429 with an empty body (checked
+// 2026-10-27), which would otherwise read as the site blocking us
+class ProxyRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProxyRefusedError';
+  }
+}
+
+function isProxyRefusal(status: number, body: string): boolean {
+  return status === 429 && body.length === 0;
+}
+
 // Seen 2026-10-24 for every Redfin /stingray/ URL, on a zone without KYC: "Residential Failed (bad_endpoint): Requested
 // site is not available for immediate residential (no KYC) access mode in accordance with robots.txt. ..."
 function brightDataRefusal(body: string): BrightDataRefusalError | null {
@@ -151,8 +164,11 @@ interface TargetState {
 const scrapeHistory: ScrapeRecord[] = [];
 const HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000; // 24-hour rolling window
 
+// redfin is /scrape's listing pages and redfin_fetch is /fetch's searches: each has its own circuit, so failing
+// page loads can't shut off searches
 const targetStates: Record<string, TargetState> = {
   redfin: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
+  redfin_fetch: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
   zillow: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
   realtor: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
   homes: { circuit: 'closed', lastStateChange: Date.now(), consecutiveBlocks: 0, lastProbeAt: null },
@@ -221,8 +237,7 @@ function checkCircuit(target: string): 'closed' | 'open' | 'half-open' {
   return state.circuit;
 }
 
-function recordScrapeResult(url: string, success: boolean, blocked: boolean) {
-  const target = getUrlTarget(url);
+function recordScrapeResult(url: string, success: boolean, blocked: boolean, target = getUrlTarget(url)) {
   scrapeHistory.push({
     timestamp: Date.now(),
     target,
@@ -243,6 +258,7 @@ function getRollingStats(): Record<string, TargetStats> {
   pruneHistory();
   const rolling: Record<string, TargetStats> = {
     redfin: { attempts: 0, successes: 0, blocks: 0 },
+    redfin_fetch: { attempts: 0, successes: 0, blocks: 0 },
     zillow: { attempts: 0, successes: 0, blocks: 0 },
     realtor: { attempts: 0, successes: 0, blocks: 0 },
     homes: { attempts: 0, successes: 0, blocks: 0 },
@@ -291,9 +307,10 @@ interface TraceStep {
   status?: number;
   detail?: string;
   tokenAgeMs?: number; // age of the Redfin WAF token sent with the request, when one was
+  lane?: number; // the Redfin lane (fixed proxy IP and its token) the step went through
 }
 
-type StepExtra = Pick<TraceStep, 'status' | 'detail' | 'tokenAgeMs'>;
+type StepExtra = Pick<TraceStep, 'status' | 'detail' | 'tokenAgeMs' | 'lane'>;
 
 const BLOCK_STATUSES = new Set([403, 405, 429, 503]);
 
@@ -450,22 +467,28 @@ class Semaphore {
   }
 }
 
-// Guarantee maximum 3 browser instances at once, and allow 2 concurrent Redfin requests with light pacing
+// Guarantee maximum 3 browser instances at once, and allow 2 concurrent Redfin requests of each kind with light pacing.
+// /fetch's searches and /scrape's listing pages queue separately: a failing page load holds its slot for 25-70s
+// (2026-10-27: searches waited 41-51s behind them and missed arv-ai's 45s deadline).
+type RedfinQueue = 'fetch' | 'scrape';
 const browserSemaphore = new Semaphore(3);
-const redfinSemaphore = new Semaphore(2);
+// Lane token refreshes run one at a time: several browsers loading redfin.com at once through the proxy got
+// NS_ERROR_PROXY_TOO_MANY_REQUESTS from Webshare (2026-10-27)
+const laneRefreshSemaphore = new Semaphore(1);
+const redfinSemaphores: Record<RedfinQueue, Semaphore> = { fetch: new Semaphore(2), scrape: new Semaphore(2) };
 
-let lastRedfinLaunchTime = 0;
-const REDFIN_MIN_LAUNCH_INTERVAL_MS = 1000; // 1.0s launch interval pacing for Redfin
+const lastRedfinLaunchTime: Record<RedfinQueue, number> = { fetch: 0, scrape: 0 };
+const REDFIN_MIN_LAUNCH_INTERVAL_MS = 1000; // 1.0s launch interval pacing for each Redfin queue
 
-async function paceRedfinRequest(): Promise<void> {
+async function paceRedfinRequest(queue: RedfinQueue): Promise<void> {
   const now = Date.now();
-  const elapsed = now - lastRedfinLaunchTime;
+  const elapsed = now - lastRedfinLaunchTime[queue];
   if (elapsed < REDFIN_MIN_LAUNCH_INTERVAL_MS) {
     const delay = REDFIN_MIN_LAUNCH_INTERVAL_MS - elapsed;
-    console.log(`[Scraper] Pacing Redfin request: waiting ${delay}ms to maintain ${REDFIN_MIN_LAUNCH_INTERVAL_MS / 1000}s launch interval...`);
+    console.log(`[Scraper] Pacing Redfin ${queue} request: waiting ${delay}ms to maintain ${REDFIN_MIN_LAUNCH_INTERVAL_MS / 1000}s launch interval...`);
     await new Promise((resolve) => setTimeout(resolve, delay));
   }
-  lastRedfinLaunchTime = Date.now();
+  lastRedfinLaunchTime[queue] = Date.now();
 }
 
 function findPhotosDeep(obj: any): any[] {
@@ -641,6 +664,16 @@ function getLaunchOptionsForAttempt(attempt: number): Record<string, any> {
     }
     console.log(`[Scraper] Attempt ${attempt}: Using proxy session username ${options.proxy.username}`);
   }
+  return options;
+}
+
+type ProxySettings = { server: string; username?: string; password?: string };
+
+// Launch options sending everything through one given proxy (a Redfin lane's), or none
+function launchOptionsWithProxy(proxy: ProxySettings | undefined): Record<string, any> {
+  const options = JSON.parse(JSON.stringify(LAUNCH_OPTIONS));
+  if (proxy) options.proxy = { ...proxy };
+  else delete options.proxy;
   return options;
 }
 
@@ -832,15 +865,34 @@ async function scrapeWithBrightData(url: string, attempt: number, trace: Request
   }
 }
 
-// Layer 1: Fast standalone HTTP GET via rotating proxy (~900ms). Null when it produced no photos.
-async function scrapeWithFastGet(url: string, attempt: number, options: Record<string, any>, trace: RequestTrace): Promise<ScrapeResult | null> {
+// Layer 1: Fast standalone HTTP GET via the proxy (~900ms); a Redfin page goes through its lane, with the lane's
+// token. Null when it produced no photos.
+async function scrapeWithFastGet(
+  url: string,
+  attempt: number,
+  options: Record<string, any>,
+  trace: RequestTrace,
+  lane?: RedfinLane
+): Promise<ScrapeResult | null> {
   const target = getUrlTarget(url);
+
+  if (lane) {
+    // Without a token Redfin answers a listing page with a challenge or a CAPTCHA (2026-10-27), so wait for the lane's
+    // refresh; when it can't get one, the page goes to the next layer without being sent
+    if (!lane.hasToken()) await waitForCookieRefresh(lane, trace, attempt);
+    else if (lane.needsRefreshSoon()) lane.refreshInBackground();
+    if (!lane.hasToken()) return null;
+  }
+
   const startedAt = Date.now();
-  const tokenAgeMs = target === 'redfin' ? redfinSession.tokenAgeMs() ?? undefined : undefined;
+  const tokenAgeMs = lane?.tokenAgeMs() ?? undefined;
+  const laneId = lane?.id;
+  let outcome: LaneOutcome = 'error';
+  const sentToken = lane?.begin();
 
   try {
-    console.log(`[Scraper] Attempt ${attempt}: Layer 1 fast HTTP GET for URL: ${url}`);
-    const cookieHeader = target === 'redfin' ? redfinSession.cookieHeader() : undefined;
+    console.log(`[Scraper] Attempt ${attempt}: Layer 1 fast HTTP GET for URL: ${url}${lane ? ` (Redfin lane ${lane.id})` : ''}`);
+    const cookieHeader = lane?.cookieHeader();
     const extraHeaders: Record<string, string> = {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -865,6 +917,7 @@ async function scrapeWithFastGet(url: string, attempt: number, options: Record<s
       const response = await requestContext.get(url, { timeout: 6000 });
       const status = response.status();
       console.log(`[Scraper] Attempt ${attempt}: Layer 1 HTTP response status: ${status}`);
+      lane?.absorbSetCookie(response.headers()['set-cookie']);
 
       if (status === 200) {
         const html = await response.text();
@@ -874,20 +927,27 @@ async function scrapeWithFastGet(url: string, attempt: number, options: Record<s
           if (photos.length > 0) {
             console.log(`[Scraper] Attempt ${attempt}: Layer 1 successful in fast path. Extracted ${photos.length} photos.`);
             const metadata = target === 'redfin' ? extractRedfinMetadata(html) : { daysOnMarket: null, listPrice: null, saleHistory: [] };
-            trace.record('fast', attempt, 'ok', startedAt, { status, tokenAgeMs });
+            trace.record('fast', attempt, 'ok', startedAt, { status, tokenAgeMs, lane: laneId });
+            outcome = 'ok';
             return {
               photos,
               ...metadata
             };
           }
-          trace.record('fast', attempt, 'empty', startedAt, { status, tokenAgeMs });
+          trace.record('fast', attempt, 'empty', startedAt, { status, tokenAgeMs, lane: laneId });
         } else {
           console.log(`[Scraper] Attempt ${attempt}: Layer 1 hit captcha/block page.`);
-          trace.record('fast', attempt, 'blocked', startedAt, { status, detail: 'block page', tokenAgeMs });
+          trace.record('fast', attempt, 'blocked', startedAt, { status, detail: 'block page', tokenAgeMs, lane: laneId });
+          outcome = 'blocked';
         }
+      } else if (isProxyRefusal(status, await response.text())) {
+        console.warn(`[Scraper] Attempt ${attempt}: Layer 1 connection refused by the proxy (HTTP 429, empty body).`);
+        trace.record('fast', attempt, 'http_error', startedAt, { status, detail: 'proxy refused', tokenAgeMs, lane: laneId });
       } else {
         console.warn(`[Scraper] Attempt ${attempt}: Layer 1 returned HTTP status ${status}.`);
-        trace.record('fast', attempt, BLOCK_STATUSES.has(status) ? 'blocked' : 'http_error', startedAt, { status, tokenAgeMs });
+        trace.record('fast', attempt, BLOCK_STATUSES.has(status) ? 'blocked' : 'http_error', startedAt, { status, tokenAgeMs, lane: laneId });
+        // 202 is AWS WAF's challenge: Redfin didn't accept the token either
+        if (BLOCK_STATUSES.has(status) || status === 202) outcome = 'blocked';
       }
     } finally {
       // Disposed on every path, a timeout included, so contexts don't pile up for the life of the process
@@ -895,7 +955,9 @@ async function scrapeWithFastGet(url: string, attempt: number, options: Record<s
     }
   } catch (err: any) {
     console.warn(`[Scraper] Attempt ${attempt}: Layer 1 failed (${err.message}).`);
-    trace.recordError('fast', attempt, err, startedAt, { tokenAgeMs });
+    trace.recordError('fast', attempt, err, startedAt, { tokenAgeMs, lane: laneId });
+  } finally {
+    lane?.end(outcome, sentToken, 'scrape');
   }
   return null;
 }
@@ -915,7 +977,14 @@ async function tryBrightData(
   }
 }
 
-async function scrapePhotosAttempt(url: string, attempt: number, options: Record<string, any>, trace: RequestTrace): Promise<ScrapeResult> {
+// A Redfin page's attempt runs every layer that leaves from our IPs (fast GET, browser) through its lane's proxy
+async function scrapePhotosAttempt(
+  url: string,
+  attempt: number,
+  options: Record<string, any>,
+  trace: RequestTrace,
+  lane?: RedfinLane
+): Promise<ScrapeResult> {
   const target = getUrlTarget(url);
   let brightDataBlock: TargetBlockedError | null = null;
 
@@ -924,10 +993,10 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
     const brightData = await tryBrightData(url, attempt, trace);
     if (brightData.result) return brightData.result;
     brightDataBlock = brightData.block;
-    const fast = await scrapeWithFastGet(url, attempt, options, trace);
+    const fast = await scrapeWithFastGet(url, attempt, options, trace, lane);
     if (fast) return fast;
   } else {
-    const fast = await scrapeWithFastGet(url, attempt, options, trace);
+    const fast = await scrapeWithFastGet(url, attempt, options, trace, lane);
     if (fast) return fast;
     if (usesBrightData(target)) {
       const brightData = await tryBrightData(url, attempt, trace);
@@ -946,13 +1015,13 @@ async function scrapePhotosAttempt(url: string, attempt: number, options: Record
   trace.record('browser_queue', attempt, 'ok', queueStart);
 
   try {
-    console.log(`[Scraper] Attempt ${attempt}: Launching Camoufox browser for URL: ${url}`);
+    console.log(`[Scraper] Attempt ${attempt}: Launching Camoufox browser for URL: ${url}${lane ? ` (Redfin lane ${lane.id})` : ''}`);
     const launchStart = Date.now();
     const browser = await Camoufox(options).catch((err) => {
-      trace.recordError('browser_launch', attempt, err, launchStart);
+      trace.recordError('browser_launch', attempt, err, launchStart, { lane: lane?.id });
       throw err;
     });
-    trace.record('browser_launch', attempt, 'ok', launchStart);
+    trace.record('browser_launch', attempt, 'ok', launchStart, { lane: lane?.id });
 
     try {
       const requestStart = Date.now();
@@ -1141,6 +1210,7 @@ async function executeScrapeWithRetries(url: string, target: string, trace: Requ
   const maxAttempts = (circuit === 'half-open' || usesBrightData(target)) ? 1 : (target === 'redfin' ? 2 : 3);
   let lastError: Error | null = null;
   let hasRealBlock = false;
+  let lane: RedfinLane | undefined;
   const renderStartTime = Date.now();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -1148,9 +1218,11 @@ async function executeScrapeWithRetries(url: string, target: string, trace: Requ
       throw new TargetBlockedError(429, 'Request timed out rendering target (20s ceiling exceeded)');
     }
 
-    const options = getLaunchOptionsForAttempt(attempt);
+    // A Redfin retry moves to another lane: a blocked lane is refreshing its token in the background
+    lane = target === 'redfin' ? pickRedfinLane(lane) : undefined;
+    const options = lane ? launchOptionsWithProxy(lane.proxy) : getLaunchOptionsForAttempt(attempt);
     try {
-      const result = await scrapePhotosAttempt(url, attempt, options, trace);
+      const result = await scrapePhotosAttempt(url, attempt, options, trace, lane);
       recordScrapeResult(url, true, false);
       updateCircuitOnSuccess(target);
       return result;
@@ -1188,8 +1260,8 @@ async function scrapePhotos(url: string, trace: RequestTrace): Promise<ScrapeRes
   const startTime = Date.now();
 
   if (target === 'redfin') {
-    await redfinSemaphore.acquire();
-    await paceRedfinRequest();
+    await redfinSemaphores.scrape.acquire();
+    await paceRedfinRequest('scrape');
     trace.record('redfin_queue', 0, 'ok', startTime);
   }
 
@@ -1197,7 +1269,7 @@ async function scrapePhotos(url: string, trace: RequestTrace): Promise<ScrapeRes
     return await executeScrapeWithRetries(url, target, trace);
   } finally {
     if (target === 'redfin') {
-      redfinSemaphore.release();
+      redfinSemaphores.scrape.release();
     }
   }
 }
@@ -1306,15 +1378,29 @@ const COOKIE_REFRESH_BACKOFF_BASE_MS = 30 * 1000; // doubles with each failure, 
 const COOKIE_REFRESH_BACKOFF_MAX_MS = 5 * 60 * 1000;
 const FRESH_TOKEN_BLOCK_MS = 60 * 1000; // a token blocked this soon after it arrived counts as a failed refresh
 
-// Redfin's session cookies, above all the AWS WAF token, shared by /fetch and the Redfin fast GET.
+type LaneOutcome = 'ok' | 'blocked' | 'error';
+
+// One Redfin lane: a fixed proxy IP, and the session cookies (above all the AWS WAF token) obtained through it.
+// Redfin's firewall cancels a token it sees from more than a couple of IPs within 5 minutes (AWS WAF Bot Control,
+// TGT_TokenReuseIp), so a lane's token is only ever sent through the lane's own proxy. Measured 2026-10-27: one token
+// shared over Webshare's rotating IPs was blocked after 2-3 uses, even from the IP it came from; a token kept on one
+// fixed IP got through 9 of 9 (6 searches, 3 listing pages).
 // All session state lives here, so sharing it across replicas (e.g. Redis) changes only this class.
-class RedfinSession {
+class RedfinLane {
   private cookies = new Map<string, string>();
   private tokenReceivedAt: number | null = null;
   private refreshing: Promise<Error | null> | null = null;
   // Refreshes in a row that didn't produce a working token; reset when a request gets through
   private failures = 0;
   private nextRefreshAt = 0;
+  // For choosing a lane, and for /health
+  inFlight = 0;
+  lastPickedAt = 0;
+  private tokenUses = 0;
+  private counts: Record<LaneOutcome, number> = { ok: 0, blocked: 0, error: 0 };
+  private lastBlockAt: number | null = null;
+
+  constructor(readonly id: number, readonly proxy: ProxySettings | undefined) {}
 
   cookieHeader(): string | undefined {
     if (this.cookies.size === 0) return undefined;
@@ -1337,6 +1423,40 @@ class RedfinSession {
     return age === null || age > COOKIE_REFRESH_AHEAD_MS;
   }
 
+  isRefreshing(): boolean {
+    return this.refreshing !== null;
+  }
+
+  // No token, and refreshing is backing off after failures: a request here would go without one
+  coolingDown(): boolean {
+    return !this.hasToken() && Date.now() < this.nextRefreshAt;
+  }
+
+  // A request is going out through this lane; returns the token it carries, for end()
+  begin(): string | undefined {
+    this.inFlight++;
+    const token = this.cookies.get('aws-waf-token');
+    if (token !== undefined) this.tokenUses++;
+    return token;
+  }
+
+  // How it went. A block cancels the token the request carried and starts getting a new one through the same IP; a
+  // token that already replaced it, while the request was out, is kept. A listing page blocked on a token younger than
+  // FRESH_TOKEN_BLOCK_MS keeps it: that says more about the page than the token, and cancelling would put the lane into
+  // backoff, taking it from /fetch. Only a search blocked on a fresh token backs the lane off.
+  end(outcome: LaneOutcome, sentToken: string | undefined, queue: RedfinQueue): void {
+    this.inFlight--;
+    this.counts[outcome]++;
+    if (outcome === 'ok') this.markWorked();
+    if (outcome !== 'blocked') return;
+    this.lastBlockAt = Date.now();
+    if (sentToken === undefined || this.cookies.get('aws-waf-token') !== sentToken) return;
+    const age = this.tokenAgeMs();
+    if (queue === 'scrape' && age !== null && age < FRESH_TOKEN_BLOCK_MS) return;
+    this.invalidateToken();
+    this.refreshInBackground();
+  }
+
   // A request got through to Redfin, so refreshing is working again
   markWorked(): void {
     this.failures = 0;
@@ -1349,10 +1469,11 @@ class RedfinSession {
     const age = this.tokenAgeMs();
     this.cookies.delete('aws-waf-token');
     this.tokenReceivedAt = null;
+    this.tokenUses = 0;
     if (age !== null && age < FRESH_TOKEN_BLOCK_MS) this.recordFailure();
   }
 
-  // Cookies from a browser context; returns whether an aws-waf-token was among them
+  // Cookies from a browser context on this lane's IP; returns whether an aws-waf-token was among them
   absorb(cookies: { name: string; value: string; domain: string }[]): boolean {
     let receivedToken = false;
     for (const cookie of cookies) {
@@ -1361,7 +1482,7 @@ class RedfinSession {
         if (cookie.name === 'aws-waf-token') receivedToken = true;
       }
     }
-    if (receivedToken) this.tokenReceivedAt = Date.now();
+    if (receivedToken) this.tokenReceived();
     return receivedToken;
   }
 
@@ -1374,7 +1495,7 @@ class RedfinSession {
         const [name, ...val] = parts.split('=');
         if (name && val) {
           this.cookies.set(name.trim(), val.join('=').trim());
-          if (name.trim() === 'aws-waf-token') this.tokenReceivedAt = Date.now();
+          if (name.trim() === 'aws-waf-token') this.tokenReceived();
         }
       }
     }
@@ -1386,7 +1507,7 @@ class RedfinSession {
     if (this.refreshing) return this.refreshing;
     const waitMs = this.nextRefreshAt - Date.now();
     if (waitMs > 0) {
-      return Promise.resolve(new Error(`Redfin cookie refresh backing off for ${Math.ceil(waitMs / 1000)}s after ${this.failures} failure(s)`));
+      return Promise.resolve(new Error(`Redfin lane ${this.id} cookie refresh backing off for ${Math.ceil(waitMs / 1000)}s after ${this.failures} failure(s)`));
     }
 
     const startedAt = Date.now();
@@ -1395,9 +1516,10 @@ class RedfinSession {
       this.refreshing = null;
       const result = failure ? classifyError(failure).result : 'ok';
       const ms = Date.now() - startedAt;
-      recordLayerStep('/fetch', 'redfin', { layer: 'cookie_refresh', attempt: 0, result, ms });
+      recordLayerStep('lanes', 'redfin', { layer: 'cookie_refresh', attempt: 0, result, ms, lane: this.id });
       console.log(JSON.stringify({
         msg: 'cookie_refresh',
+        lane: this.id,
         result,
         ms,
         error: failure ? errorDetail(failure) : null,
@@ -1417,12 +1539,24 @@ class RedfinSession {
   status() {
     const age = this.tokenAgeMs();
     return {
+      lane: this.id,
       hasToken: this.hasToken(),
       tokenAgeSec: age === null ? null : Math.round(age / 1000),
+      tokenUses: this.tokenUses,
       refreshing: this.refreshing !== null,
       failures: this.failures,
       backoffSec: Math.max(0, Math.ceil((this.nextRefreshAt - Date.now()) / 1000)),
+      inFlight: this.inFlight,
+      ok: this.counts.ok,
+      blocked: this.counts.blocked,
+      errors: this.counts.error,
+      lastBlockSecAgo: this.lastBlockAt === null ? null : Math.round((Date.now() - this.lastBlockAt) / 1000),
     };
+  }
+
+  private tokenReceived(): void {
+    this.tokenReceivedAt = Date.now();
+    this.tokenUses = 0;
   }
 
   private recordFailure(): void {
@@ -1432,14 +1566,22 @@ class RedfinSession {
 
   private async loadHomepage(): Promise<Error | null> {
     let browser: Browser | undefined;
+    await laneRefreshSemaphore.acquire();
     await browserSemaphore.acquire();
     try {
-      console.log('[Fetcher] Warming Redfin session and WAF tokens via Camoufox...');
-      const launched: Browser = await Camoufox(getLaunchOptionsForAttempt(1));
+      console.log(`[Fetcher] Warming Redfin lane ${this.id} session and WAF tokens via Camoufox...`);
+      const launched: Browser = await Camoufox(launchOptionsWithProxy(this.proxy));
       browser = launched;
       const context = await launched.newContext();
       const page = await context.newPage();
-      await page.goto('https://www.redfin.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
+      const response = await page.goto('https://www.redfin.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
+      // An IP Redfin has flagged gets a CAPTCHA (405) even on the homepage. A token still appears there, but it opens
+      // nothing: 6 of 6 searches 403 and 3 of 3 pages 405 with it (2026-10-27). 202 is the silent challenge, which the
+      // page solves itself.
+      const status = response?.status() ?? 0;
+      if (status === 403 || status === 405 || status === 429) {
+        return new Error(`Redfin answered its homepage with HTTP ${status}${status === 405 ? ' (CAPTCHA)' : ''} on this IP`);
+      }
 
       // The token is set by a script shortly after the page loads, so wait for the cookie itself
       // rather than for the network to go idle
@@ -1453,26 +1595,76 @@ class RedfinSession {
       }
 
       const receivedToken = this.absorb(cookies);
-      console.log(`[Fetcher] Warmed Redfin cookies (${this.cookies.size} cookies cached, aws-waf-token received: ${receivedToken})`);
+      console.log(`[Fetcher] Warmed Redfin lane ${this.id} cookies (${this.cookies.size} cookies cached, aws-waf-token received: ${receivedToken})`);
       return receivedToken ? null : new Error(`No aws-waf-token cookie within ${COOKIE_TOKEN_WAIT_MS / 1000}s of the page loading`);
     } catch (err) {
-      console.error('[Fetcher] Error warming Redfin cookies:', err);
+      console.error(`[Fetcher] Error warming Redfin lane ${this.id} cookies:`, err);
       return err instanceof Error ? err : new Error(String(err));
     } finally {
       if (browser) await browser.close().catch(() => {});
       browserSemaphore.release();
+      laneRefreshSemaphore.release();
     }
   }
 }
 
-const redfinSession = new RedfinSession();
+// Webshare gives a fixed IP when the username ends in a number instead of "rotate". The plan has 6: -us-1 to -us-6
+// answered and -us-7 and up didn't (2026-10-27). REDFIN_PROXY_LANES overrides the count.
+const REDFIN_LANES_DEFAULT = 6;
 
-// A /fetch request waiting on a refresh, with no token or after a block; the refresh itself is logged as cookie_refresh
-async function waitForCookieRefresh(trace: RequestTrace, attempt: number): Promise<void> {
+function redfinLaneProxies(): (ProxySettings | undefined)[] {
+  const proxy = LAUNCH_OPTIONS.proxy as ProxySettings | undefined;
+  if (!proxy) return [undefined];
+  const username = proxy.username ?? '';
+  if (!proxy.server.includes('webshare') || !/-rotate$/i.test(username)) {
+    console.warn('[Redfin] PROXY_URL is not a Webshare "-rotate" username, so Redfin runs on one lane through the proxy as configured. If that proxy changes IPs, Redfin will cancel the lane\'s token.');
+    return [{ ...proxy }];
+  }
+  let count = REDFIN_LANES_DEFAULT;
+  const configured = process.env.REDFIN_PROXY_LANES;
+  if (configured !== undefined) {
+    const n = Number(configured);
+    if (Number.isInteger(n) && n >= 1 && n <= 100) count = n;
+    else console.warn(`[Redfin] REDFIN_PROXY_LANES="${configured}" is not a whole number from 1 to 100. Using ${REDFIN_LANES_DEFAULT}.`);
+  }
+  return Array.from({ length: count }, (_, i) => ({ ...proxy, username: username.replace(/rotate$/i, String(i + 1)) }));
+}
+
+const redfinLanes = redfinLaneProxies().map((proxy, i) => new RedfinLane(i + 1, proxy));
+console.log(`[Redfin] ${redfinLanes.length} lane(s): ${redfinLanes.map((l) => l.proxy?.username ?? 'no proxy').join(', ')}`);
+// Every lane gets its token at startup, one at a time, so a flagged IP is found (and backed off) before a request waits
+// on it: on 2026-10-27, 3 of the 6 IPs got a CAPTCHA on the homepage, and the first searches waited 28s finding that out
+for (const lane of redfinLanes) lane.refreshInBackground();
+
+// The lane for the next Redfin request: one with a token if any has, the least busy and then the longest unused, so
+// traffic spreads over every IP. A lane cooling down after failed refreshes is skipped while another can serve.
+// exclude is the lane a retry is leaving.
+function pickRedfinLane(exclude?: RedfinLane): RedfinLane {
+  const others = redfinLanes.filter((l) => l !== exclude);
+  const pool = others.length > 0 ? others : redfinLanes;
+  const usable = pool.filter((l) => !l.coolingDown());
+  const candidates = usable.length > 0 ? usable : pool;
+  const withToken = candidates.filter((l) => l.hasToken());
+  // While some lanes have no token, warm the longest-unused one in the background, one at a time, so every IP comes
+  // into use
+  if (withToken.length > 0 && !redfinLanes.some((l) => l.isRefreshing())) {
+    const cold = candidates.filter((l) => !l.hasToken() && !l.isRefreshing()).sort((a, b) => a.lastPickedAt - b.lastPickedAt)[0];
+    cold?.refreshInBackground();
+  }
+  // With no token anywhere, a request joins a refresh already running rather than starting another
+  const refreshing = candidates.filter((l) => l.isRefreshing());
+  const choices = withToken.length > 0 ? withToken : refreshing.length > 0 ? refreshing : candidates;
+  const lane = choices.sort((a, b) => a.inFlight - b.inFlight || a.lastPickedAt - b.lastPickedAt)[0];
+  lane.lastPickedAt = Date.now();
+  return lane;
+}
+
+// A request waiting on its lane's refresh, with no token or after a block; the refresh itself is logged as cookie_refresh
+async function waitForCookieRefresh(lane: RedfinLane, trace: RequestTrace, attempt: number): Promise<void> {
   const startedAt = Date.now();
-  const failure = await redfinSession.refresh();
-  if (failure) trace.recordError('cookie_wait', attempt, failure, startedAt);
-  else trace.record('cookie_wait', attempt, 'ok', startedAt);
+  const failure = await lane.refresh();
+  if (failure) trace.recordError('cookie_wait', attempt, failure, startedAt, { lane: lane.id });
+  else trace.record('cookie_wait', attempt, 'ok', startedAt, { lane: lane.id });
 }
 
 // A /zipcode/ page, after the browser failed. Not used for /stingray/: Bright Data refuses those (see brightDataRefusal).
@@ -1532,8 +1724,8 @@ async function fetchZipcodeWithBrightData(url: string, trace: RequestTrace, atte
       throw new Error('Redfin region id not found on zipcode page');
     }
     const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
-    recordScrapeResult(url, true, false);
-    updateCircuitOnSuccess('redfin');
+    recordScrapeResult(url, true, false, 'redfin_fetch');
+    updateCircuitOnSuccess('redfin_fetch');
     trace.record('brightdata', attempt, 'ok', startedAt);
     return {
       status: 200,
@@ -1554,15 +1746,17 @@ async function fetchZipcodeWithBrightData(url: string, trace: RequestTrace, atte
 async function renderZipcodePage(url: string, trace: RequestTrace): Promise<FetchResult> {
   let browser;
   const startedAt = Date.now();
+  // Through a lane, so the cookies the page sets are kept by the lane whose IP they came from
+  const lane = pickRedfinLane();
   try {
-    const options = getLaunchOptionsForAttempt(1);
+    const options = launchOptionsWithProxy(lane.proxy);
     browser = await Camoufox(options);
     const context = await browser.newContext();
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(3000);
 
-    redfinSession.absorb(await context.cookies());
+    lane.absorb(await context.cookies());
 
     const extracted = await page.evaluate(() => {
       const state = (window as any).__reactServerState;
@@ -1592,15 +1786,15 @@ async function renderZipcodePage(url: string, trace: RequestTrace): Promise<Fetc
       throw new Error('Redfin region id not found on zipcode page');
     }
 
-    recordScrapeResult(url, true, false);
-    updateCircuitOnSuccess('redfin');
-    trace.record('browser', 1, 'ok', startedAt);
+    recordScrapeResult(url, true, false, 'redfin_fetch');
+    updateCircuitOnSuccess('redfin_fetch');
+    trace.record('browser', 1, 'ok', startedAt, { lane: lane.id });
     return {
       status: 200,
       data: extracted
     };
   } catch (err: any) {
-    trace.recordError('browser', 1, err, startedAt);
+    trace.recordError('browser', 1, err, startedAt, { lane: lane.id });
     if (browser) {
       await browser.close().catch(() => {});
       browser = undefined;
@@ -1615,21 +1809,28 @@ async function renderZipcodePage(url: string, trace: RequestTrace): Promise<Fetc
   }
 }
 
-// The /fetch request to Redfin, through the proxy with the session's cookies
+// The /fetch request to Redfin, through the lane's proxy with the lane's cookies
 async function fetchRedfinDirect(
   url: string,
+  lane: RedfinLane,
   trace: RequestTrace,
   attempt: number
-): Promise<{ kind: 'ok'; result: FetchResult } | { kind: 'blocked'; status: number; finalUrl: string } | { kind: 'error'; err: unknown }> {
+): Promise<
+  | { kind: 'ok'; result: FetchResult }
+  | { kind: 'blocked'; status: number; finalUrl: string }
+  | { kind: 'refused'; err: ProxyRefusedError }
+  | { kind: 'error'; err: unknown }
+> {
   const FETCH_TIMEOUT_MS = 15000;
-  const options = getLaunchOptionsForAttempt(1);
-  const tokenAgeMs = redfinSession.tokenAgeMs() ?? undefined;
+  const tokenAgeMs = lane.tokenAgeMs() ?? undefined;
   const startedAt = Date.now();
+  let outcome: LaneOutcome = 'error';
+  const sentToken = lane.begin();
 
-  console.log(`[Fetcher] Executing proxied fetch for URL: ${url}`);
+  console.log(`[Fetcher] Executing proxied fetch on Redfin lane ${lane.id} for URL: ${url}`);
   let requestContext: APIRequestContext | undefined;
   try {
-    const cookieHeader = redfinSession.cookieHeader();
+    const cookieHeader = lane.cookieHeader();
     const extraHeaders: Record<string, string> = {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0',
       'Accept': '*/*',
@@ -1641,22 +1842,27 @@ async function fetchRedfinDirect(
     }
 
     requestContext = await request.newContext({
-      proxy: options.proxy,
+      proxy: lane.proxy,
       extraHTTPHeaders: extraHeaders
     });
 
     const response = await requestContext.get(url, { timeout: FETCH_TIMEOUT_MS });
     const status = response.status();
     const finalUrl = response.url();
-    const rawHeaders = response.headers();
-    if (rawHeaders['set-cookie']) {
-      redfinSession.absorbSetCookie(rawHeaders['set-cookie']);
-    }
+    lane.absorbSetCookie(response.headers()['set-cookie']);
     const text = await response.text();
 
+    if (isProxyRefusal(status, text)) {
+      const err = new ProxyRefusedError('The proxy refused the connection (HTTP 429, empty body)');
+      trace.recordError('fast', attempt, err, startedAt, { status, detail: 'proxy refused', tokenAgeMs, lane: lane.id });
+      return { kind: 'refused', err };
+    }
+
+    // 202 and 405 are AWS WAF's challenge and CAPTCHA: Redfin didn't accept the token
     const blockedBy = finalUrl.includes('ratelimited.redfin.com') ? 'ratelimited redirect' : isCaptchaOrBlockPage(text) ? 'block page' : undefined;
-    if (status === 403 || status === 429 || status === 503 || blockedBy) {
-      trace.record('fast', attempt, 'blocked', startedAt, { status, detail: blockedBy, tokenAgeMs });
+    if (BLOCK_STATUSES.has(status) || status === 202 || blockedBy) {
+      trace.record('fast', attempt, 'blocked', startedAt, { status, detail: blockedBy, tokenAgeMs, lane: lane.id });
+      outcome = 'blocked';
       return { kind: 'blocked', status, finalUrl };
     }
 
@@ -1665,66 +1871,75 @@ async function fetchRedfinDirect(
       data = JSON.parse(text.trim().replace(/^\{\}&&/, ''));
     } catch {
       const err = new InvalidResponseError(`Redfin answered HTTP ${status} with a body that isn't JSON`);
-      trace.recordError('fast', attempt, err, startedAt, { status, tokenAgeMs });
+      trace.recordError('fast', attempt, err, startedAt, { status, tokenAgeMs, lane: lane.id });
       return { kind: 'error', err };
     }
 
-    trace.record('fast', attempt, status >= 200 && status < 300 ? 'ok' : 'http_error', startedAt, { status, tokenAgeMs });
+    const ok = status >= 200 && status < 300;
+    trace.record('fast', attempt, ok ? 'ok' : 'http_error', startedAt, { status, tokenAgeMs, lane: lane.id });
+    if (ok) outcome = 'ok';
     return { kind: 'ok', result: { status, data } };
   } catch (err) {
-    trace.recordError('fast', attempt, err, startedAt, { tokenAgeMs });
+    trace.recordError('fast', attempt, err, startedAt, { tokenAgeMs, lane: lane.id });
     return { kind: 'error', err };
   } finally {
+    lane.end(outcome, sentToken, 'fetch');
     await requestContext?.dispose().catch(() => {});
   }
 }
 
-// Redfin directly, never Bright Data: it refuses every /stingray/ URL (see brightDataRefusal)
-async function fetchRedfinLayers(url: string, trace: RequestTrace, retryOnBlock: boolean): Promise<FetchResult> {
-  const attempt = retryOnBlock ? 1 : 2;
-  let refreshedNow = false;
+// Redfin directly, never Bright Data: it refuses every /stingray/ URL (see brightDataRefusal). A block moves the retry to
+// another lane at once, while the blocked lane gets a new token through its own IP in the background.
+async function fetchRedfinLayers(url: string, trace: RequestTrace): Promise<FetchResult> {
+  let lane = pickRedfinLane();
+  let lastBlock: { status: number; finalUrl: string } | null = null;
+  let lastRefusal: ProxyRefusedError | null = null;
 
-  if (retryOnBlock && !redfinSession.hasToken()) {
-    await waitForCookieRefresh(trace, attempt);
-    refreshedNow = true;
-  } else if (redfinSession.needsRefreshSoon()) {
-    // An old token is used as it is, since one past 20 minutes still got through 8 of 10 times in production
-    // (2026-10-23/24); the refresh runs alongside, and a block still refreshes and retries below
-    redfinSession.refreshInBackground();
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (attempt === 2) lane = pickRedfinLane(lane);
+    if (!lane.hasToken()) {
+      await waitForCookieRefresh(lane, trace, attempt);
+    } else if (lane.needsRefreshSoon()) {
+      // An old token is used as it is, since one past 20 minutes still got through 8 of 10 times in production
+      // (2026-10-23/24); the refresh runs alongside, and a block still moves the retry to another lane
+      lane.refreshInBackground();
+    }
+    // Without a token Redfin refuses every /stingray/ URL (403, 2026-10-27), so nothing is sent
+    if (!lane.hasToken()) continue;
+
+    const direct = await fetchRedfinDirect(url, lane, trace, attempt);
+    if (direct.kind === 'ok') {
+      recordScrapeResult(url, true, false, 'redfin_fetch');
+      updateCircuitOnSuccess('redfin_fetch');
+      return direct.result;
+    }
+    if (direct.kind === 'error') {
+      throw direct.err;
+    }
+    if (direct.kind === 'refused') {
+      // Not Redfin: the lane keeps its token, and the retry goes to another IP
+      lastRefusal = direct.err;
+      console.warn(`[Fetcher] The proxy refused Redfin lane ${lane.id}${attempt === 1 ? ', retrying on another lane' : ''}`);
+      continue;
+    }
+    lastBlock = direct;
+    console.warn(`[Fetcher] Redfin lane ${lane.id} blocked with status ${direct.status}${attempt === 1 ? ', retrying on another lane' : ''}`);
   }
 
-  const direct = await fetchRedfinDirect(url, trace, attempt);
-
-  if (direct.kind === 'ok') {
-    redfinSession.markWorked();
-    recordScrapeResult(url, true, false);
-    updateCircuitOnSuccess('redfin');
-    return direct.result;
+  if (lastBlock === null) {
+    // Redfin refused nothing, so the circuit is left alone
+    if (lastRefusal) throw lastRefusal;
+    throw new TargetBlockedError(503, 'No Redfin token: every lane is refreshing or backing off');
   }
-
-  if (direct.kind === 'error') {
-    throw direct.err;
-  }
-
-  // Blocked: the token didn't get us in
-  redfinSession.invalidateToken();
-
-  // One refresh per request at most: retry only if this request hasn't refreshed yet
-  if (retryOnBlock && !refreshedNow) {
-    console.warn(`[Fetcher] Request blocked with status ${direct.status}, re-warming Camoufox session cookies and retrying...`);
-    await waitForCookieRefresh(trace, attempt);
-    return await fetchRedfinLayers(url, trace, false);
-  }
-
-  console.warn(`[Fetcher] Target blocked with status ${direct.status}, url: ${direct.finalUrl}`);
-  recordScrapeResult(url, false, true);
-  updateCircuitOnBlock('redfin');
-  throw new TargetBlockedError(429, `Target page returned HTTP status ${direct.status}`);
+  console.warn(`[Fetcher] Target blocked with status ${lastBlock.status}, url: ${lastBlock.finalUrl}`);
+  recordScrapeResult(url, false, true, 'redfin_fetch');
+  updateCircuitOnBlock('redfin_fetch');
+  throw new TargetBlockedError(429, `Target page returned HTTP status ${lastBlock.status}`);
 }
 
 // Errors leave /fetch as a block, an open circuit, a timeout, an invalid response, or as they are
 function toFetchError(err: any, url: string): unknown {
-  if (err instanceof TargetBlockedError || err instanceof CircuitOpenError || err instanceof FetchTimeoutError || err instanceof InvalidResponseError) {
+  if (err instanceof TargetBlockedError || err instanceof CircuitOpenError || err instanceof FetchTimeoutError || err instanceof InvalidResponseError || err instanceof ProxyRefusedError) {
     return err;
   }
   const msg = err?.message?.toLowerCase() || '';
@@ -1742,17 +1957,17 @@ async function executeFetchRequest(url: string, trace: RequestTrace): Promise<Fe
   }
 
   try {
-    return await fetchRedfinLayers(url, trace, true);
+    return await fetchRedfinLayers(url, trace);
   } catch (err) {
     throw toFetchError(err, url);
   }
 }
 
 async function fetchRedfinWithQueue(url: string, trace: RequestTrace): Promise<FetchResult> {
-  const circuit = checkCircuit('redfin');
+  const circuit = checkCircuit('redfin_fetch');
   if (circuit === 'open') {
     console.log(`[Circuit Breaker] Skipping fetch for ${url} (Circuit is OPEN).`);
-    recordScrapeResult(url, false, true);
+    recordScrapeResult(url, false, true, 'redfin_fetch');
     throw new CircuitOpenError(429, `Target page returned HTTP status 429 [Circuit is OPEN]`);
   }
 
@@ -1767,13 +1982,13 @@ async function fetchRedfinWithQueue(url: string, trace: RequestTrace): Promise<F
 
   const worker = async () => {
     const queueStart = Date.now();
-    await redfinSemaphore.acquire();
+    await redfinSemaphores.fetch.acquire();
     try {
-      await paceRedfinRequest();
+      await paceRedfinRequest('fetch');
       trace.record('redfin_queue', 0, 'ok', queueStart);
       return await executeFetchRequest(url, trace);
     } finally {
-      redfinSemaphore.release();
+      redfinSemaphores.fetch.release();
     }
   };
 
@@ -1829,6 +2044,13 @@ app.post('/fetch', async (req: Request, res: Response) => {
       res.status(504).json({
         reason: 'timeout'
       });
+    } else if (error instanceof ProxyRefusedError) {
+      trace.reason = 'proxy_refused';
+      res.status(503).json({
+        error: error.message,
+        reason: 'proxy_refused',
+        status: 503
+      });
     } else if (error instanceof InvalidResponseError) {
       trace.reason = 'invalid_response';
       res.status(502).json({
@@ -1866,7 +2088,7 @@ app.get('/health', (_req: Request, res: Response) => {
     status: deriveStatus(),
     uptime: process.uptime(),
     stats: formattedStats,
-    redfinSession: redfinSession.status(),
+    redfinLanes: redfinLanes.map((lane) => lane.status()),
     layers: getLayerStats(),
   });
 });
