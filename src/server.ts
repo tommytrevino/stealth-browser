@@ -1,4 +1,6 @@
 import express, { Request, Response } from 'express';
+import { randomUUID } from 'crypto';
+import { readdirSync, readFileSync } from 'fs';
 import { Camoufox } from 'camoufox-js';
 import { request, type APIRequestContext, type Browser } from 'playwright-core';
 
@@ -677,6 +679,130 @@ function launchOptionsWithProxy(proxy: ProxySettings | undefined): Record<string
   return options;
 }
 
+// Every browser runs through withBrowser, which always gets rid of it: closed normally, or killed when the work or the
+// close takes too long. Playwright's close() waits for the browser process to exit with no time limit, so a wedged
+// browser used to hold its queue slots for good: from 2026-11-03 a token refresh never returned, every Redfin search
+// waited on it, and actives were down for a week. Playwright doesn't expose the browser's PID, so each browser carries
+// an ID in its environment (inherited by its child processes) and is found in /proc by it.
+const BROWSER_ID_ENV = 'STEALTH_BROWSER_ID';
+const BROWSER_CLOSE_TIMEOUT_MS = 10000;
+// Launch, a 4s request, a 7s page load and extraction normally finish well inside these
+const BROWSER_LAYER_DEADLINE_MS = 40000;
+const ZIPCODE_RENDER_DEADLINE_MS = 45000; // its page load uses Playwright's default 30s timeout, then waits 3s
+const browserCounts = { open: 0, killed: 0 };
+
+class BrowserDeadlineError extends Error {
+  constructor(label: string, ms: number) {
+    super(`${label} timed out after ${ms / 1000}s`);
+    this.name = 'BrowserDeadlineError';
+  }
+}
+
+async function withBrowser<T>(
+  options: Record<string, any>,
+  deadlineMs: number,
+  label: string,
+  work: (browser: Browser) => Promise<T>
+): Promise<T> {
+  const id = randomUUID();
+  let browser: Browser | undefined;
+  let expired = false;
+  let timer: NodeJS.Timeout | undefined;
+  browserCounts.open++;
+  const run = (async () => {
+    const launched: Browser = await Camoufox({ ...options, env: { ...process.env, [BROWSER_ID_ENV]: id } });
+    browser = launched;
+    // The launch finished after the deadline, once the cleanup below had already run
+    if (expired) {
+      await disposeBrowser(id, launched, label);
+      throw new BrowserDeadlineError(label, deadlineMs);
+    }
+    return await work(launched);
+  })();
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      expired = true;
+      reject(new BrowserDeadlineError(label, deadlineMs));
+    }, deadlineMs);
+  });
+  try {
+    return await Promise.race([run, deadline]);
+  } finally {
+    clearTimeout(timer);
+    // After a deadline the work is still pending; it fails once its browser is gone
+    run.catch(() => {});
+    await disposeBrowser(id, browser, label);
+    browserCounts.open--;
+  }
+}
+
+async function disposeBrowser(id: string, browser: Browser | undefined, label: string): Promise<void> {
+  if (browser) {
+    const closed = await Promise.race([
+      browser.close().then(() => true, () => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), BROWSER_CLOSE_TIMEOUT_MS)),
+    ]);
+    if (closed) return;
+    console.warn(`[Browser] ${label}: close() took longer than ${BROWSER_CLOSE_TIMEOUT_MS / 1000}s`);
+  }
+  // A launch that failed on its own leaves nothing behind (Playwright kills it), so this only finds something after a
+  // deadline or a close that hung
+  const killed = killBrowserProcesses(id);
+  if (killed > 0) {
+    browserCounts.killed++;
+    console.warn(`[Browser] ${label}: killed ${killed} browser process(es)`);
+  }
+}
+
+// SIGKILLs every process whose environment carries this browser's ID. Linux only (/proc); elsewhere it finds nothing.
+function killBrowserProcesses(id: string): number {
+  if (process.platform !== 'linux') return 0;
+  const marker = `${BROWSER_ID_ENV}=${id}`;
+  let killed = 0;
+  for (const entry of readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    let environ: string;
+    try {
+      environ = readFileSync(`/proc/${entry}/environ`, 'latin1');
+    } catch {
+      continue;
+    }
+    if (!environ.split('\0').includes(marker)) continue;
+    try {
+      process.kill(Number(entry), 'SIGKILL');
+      killed++;
+    } catch {}
+  }
+  return killed;
+}
+
+// Processes in the container, and the cgroup's limit on processes plus threads. Every browser launch used to leave 4
+// zombies (orphaned Firefox helpers that node, as PID 1, never reaped: 28 after 7 launches on 2026-11-11), and
+// pids.max is 1000: the limit was reached on 2026-11-04 and every launch after it crashed. tini reaps them now.
+function processStats(): { processes: number; zombies: number; pidsCurrent: number | null; pidsMax: string | null } | null {
+  if (process.platform !== 'linux') return null;
+  let processes = 0;
+  let zombies = 0;
+  for (const entry of readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    processes++;
+    try {
+      const stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
+      // The state follows the parenthesised command name, which may itself contain spaces or parentheses
+      if (stat.charAt(stat.lastIndexOf(')') + 2) === 'Z') zombies++;
+    } catch {}
+  }
+  const read = (path: string) => {
+    try {
+      return readFileSync(path, 'utf8').trim();
+    } catch {
+      return null;
+    }
+  };
+  const current = read('/sys/fs/cgroup/pids.current');
+  return { processes, zombies, pidsCurrent: current === null ? null : Number(current), pidsMax: read('/sys/fs/cgroup/pids.max') };
+}
+
 export interface SaleHistoryEntry {
   date: string;
   event: string;
@@ -1014,16 +1140,13 @@ async function scrapePhotosAttempt(
   await browserSemaphore.acquire();
   trace.record('browser_queue', attempt, 'ok', queueStart);
 
+  console.log(`[Scraper] Attempt ${attempt}: Launching Camoufox browser for URL: ${url}${lane ? ` (Redfin lane ${lane.id})` : ''}`);
+  const launchStart = Date.now();
+  let launched = false;
   try {
-    console.log(`[Scraper] Attempt ${attempt}: Launching Camoufox browser for URL: ${url}${lane ? ` (Redfin lane ${lane.id})` : ''}`);
-    const launchStart = Date.now();
-    const browser = await Camoufox(options).catch((err) => {
-      trace.recordError('browser_launch', attempt, err, launchStart, { lane: lane?.id });
-      throw err;
-    });
-    trace.record('browser_launch', attempt, 'ok', launchStart, { lane: lane?.id });
-
-    try {
+    return await withBrowser(options, BROWSER_LAYER_DEADLINE_MS, `Browser layer for ${url}`, async (browser) => {
+      launched = true;
+      trace.record('browser_launch', attempt, 'ok', launchStart, { lane: lane?.id });
       const requestStart = Date.now();
       try {
         console.log(`[Scraper] Attempt ${attempt}: Attempting browser-context HTTP GET...`);
@@ -1079,10 +1202,11 @@ async function scrapePhotosAttempt(
         trace.recordError('browser_render', attempt, err, renderStart);
         throw err;
       }
-    } finally {
-      console.log(`[Scraper] Attempt ${attempt}: Closing Camoufox browser.`);
-      await browser.close();
-    }
+    });
+  } catch (err) {
+    if (!launched) trace.recordError('browser_launch', attempt, err, launchStart, { lane: lane?.id });
+    else if (err instanceof BrowserDeadlineError) trace.recordError('browser_deadline', attempt, err, launchStart, { lane: lane?.id });
+    throw err;
   } finally {
     browserSemaphore.release();
     console.log(`[Scraper] Attempt ${attempt}: Released browser queue for URL: ${url}`);
@@ -1374,6 +1498,10 @@ interface FetchResult {
 
 const COOKIE_REFRESH_AHEAD_MS = 15 * 60 * 1000; // past this age, a request starts a background refresh
 const COOKIE_TOKEN_WAIT_MS = 10 * 1000; // how long a refresh waits for aws-waf-token once the page has loaded
+// A whole refresh (launch, homepage, token, close) normally takes 5-25s; past this its browser is killed
+const COOKIE_REFRESH_DEADLINE_MS = 45 * 1000;
+// How long one request waits on refreshes in total, so a /fetch answers inside arv-ai's 45s even when they fail
+const COOKIE_WAIT_MAX_MS = 20 * 1000;
 const COOKIE_REFRESH_BACKOFF_BASE_MS = 30 * 1000; // doubles with each failure, up to the max
 const COOKIE_REFRESH_BACKOFF_MAX_MS = 5 * 60 * 1000;
 const FRESH_TOKEN_BLOCK_MS = 60 * 1000; // a token blocked this soon after it arrived counts as a failed refresh
@@ -1565,46 +1693,46 @@ class RedfinLane {
   }
 
   private async loadHomepage(): Promise<Error | null> {
-    let browser: Browser | undefined;
     await laneRefreshSemaphore.acquire();
     await browserSemaphore.acquire();
     try {
       console.log(`[Fetcher] Warming Redfin lane ${this.id} session and WAF tokens via Camoufox...`);
-      const launched: Browser = await Camoufox(launchOptionsWithProxy(this.proxy));
-      browser = launched;
-      const context = await launched.newContext();
-      const page = await context.newPage();
-      const response = await page.goto('https://www.redfin.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
-      // An IP Redfin has flagged gets a CAPTCHA (405) even on the homepage. A token still appears there, but it opens
-      // nothing: 6 of 6 searches 403 and 3 of 3 pages 405 with it (2026-10-27). 202 is the silent challenge, which the
-      // page solves itself.
-      const status = response?.status() ?? 0;
-      if (status === 403 || status === 405 || status === 429) {
-        return new Error(`Redfin answered its homepage with HTTP ${status}${status === 405 ? ' (CAPTCHA)' : ''} on this IP`);
-      }
-
-      // The token is set by a script shortly after the page loads, so wait for the cookie itself
-      // rather than for the network to go idle
-      const hasToken = (cookies: { name: string; domain: string }[]) =>
-        cookies.some((c) => c.name === 'aws-waf-token' && c.domain.includes('redfin.com'));
-      const deadline = Date.now() + COOKIE_TOKEN_WAIT_MS;
-      let cookies = await context.cookies();
-      while (!hasToken(cookies) && Date.now() < deadline) {
-        await page.waitForTimeout(250);
-        cookies = await context.cookies();
-      }
-
-      const receivedToken = this.absorb(cookies);
-      console.log(`[Fetcher] Warmed Redfin lane ${this.id} cookies (${this.cookies.size} cookies cached, aws-waf-token received: ${receivedToken})`);
-      return receivedToken ? null : new Error(`No aws-waf-token cookie within ${COOKIE_TOKEN_WAIT_MS / 1000}s of the page loading`);
+      return await withBrowser(launchOptionsWithProxy(this.proxy), COOKIE_REFRESH_DEADLINE_MS, `Redfin lane ${this.id} token refresh`, (browser) => this.readToken(browser));
     } catch (err) {
       console.error(`[Fetcher] Error warming Redfin lane ${this.id} cookies:`, err);
       return err instanceof Error ? err : new Error(String(err));
     } finally {
-      if (browser) await browser.close().catch(() => {});
       browserSemaphore.release();
       laneRefreshSemaphore.release();
     }
+  }
+
+  private async readToken(browser: Browser): Promise<Error | null> {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const response = await page.goto('https://www.redfin.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    // An IP Redfin has flagged gets a CAPTCHA (405) even on the homepage. A token still appears there, but it opens
+    // nothing: 6 of 6 searches 403 and 3 of 3 pages 405 with it (2026-10-27). 202 is the silent challenge, which the
+    // page solves itself.
+    const status = response?.status() ?? 0;
+    if (status === 403 || status === 405 || status === 429) {
+      return new Error(`Redfin answered its homepage with HTTP ${status}${status === 405 ? ' (CAPTCHA)' : ''} on this IP`);
+    }
+
+    // The token is set by a script shortly after the page loads, so wait for the cookie itself
+    // rather than for the network to go idle
+    const hasToken = (cookies: { name: string; domain: string }[]) =>
+      cookies.some((c) => c.name === 'aws-waf-token' && c.domain.includes('redfin.com'));
+    const deadline = Date.now() + COOKIE_TOKEN_WAIT_MS;
+    let cookies = await context.cookies();
+    while (!hasToken(cookies) && Date.now() < deadline) {
+      await page.waitForTimeout(250);
+      cookies = await context.cookies();
+    }
+
+    const receivedToken = this.absorb(cookies);
+    console.log(`[Fetcher] Warmed Redfin lane ${this.id} cookies (${this.cookies.size} cookies cached, aws-waf-token received: ${receivedToken})`);
+    return receivedToken ? null : new Error(`No aws-waf-token cookie within ${COOKIE_TOKEN_WAIT_MS / 1000}s of the page loading`);
   }
 }
 
@@ -1659,10 +1787,17 @@ function pickRedfinLane(exclude?: RedfinLane): RedfinLane {
   return lane;
 }
 
-// A request waiting on its lane's refresh, with no token or after a block; the refresh itself is logged as cookie_refresh
-async function waitForCookieRefresh(lane: RedfinLane, trace: RequestTrace, attempt: number): Promise<void> {
+// A request waiting on its lane's refresh, with no token or after a block, for at most maxMs; the refresh itself goes
+// on and is logged as cookie_refresh
+async function waitForCookieRefresh(lane: RedfinLane, trace: RequestTrace, attempt: number, maxMs = COOKIE_WAIT_MAX_MS): Promise<void> {
   const startedAt = Date.now();
-  const failure = await lane.refresh();
+  if (maxMs <= 0) return;
+  let timer: NodeJS.Timeout | undefined;
+  const gaveUp = new Promise<Error>((resolve) => {
+    timer = setTimeout(() => resolve(new Error(`Gave up after ${Math.round(maxMs / 1000)}s waiting for Redfin lane ${lane.id}'s token refresh`)), maxMs);
+  });
+  const failure = await Promise.race([lane.refresh(), gaveUp]);
+  clearTimeout(timer);
   if (failure) trace.recordError('cookie_wait', attempt, failure, startedAt, { lane: lane.id });
   else trace.record('cookie_wait', attempt, 'ok', startedAt, { lane: lane.id });
 }
@@ -1744,43 +1879,11 @@ async function fetchZipcodeWithBrightData(url: string, trace: RequestTrace, atte
 }
 
 async function renderZipcodePage(url: string, trace: RequestTrace): Promise<FetchResult> {
-  let browser;
   const startedAt = Date.now();
   // Through a lane, so the cookies the page sets are kept by the lane whose IP they came from
   const lane = pickRedfinLane();
   try {
-    const options = launchOptionsWithProxy(lane.proxy);
-    browser = await Camoufox(options);
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(3000);
-
-    lane.absorb(await context.cookies());
-
-    const extracted = await page.evaluate(() => {
-      const state = (window as any).__reactServerState;
-      const cache = state?.InitialContext?.['ReactServerAgent.cache']?.dataCache || {};
-      const gisKey = Object.keys(cache).find(k => k.includes('gis'));
-      let region_id: string | null = null;
-      let region_type: string | null = null;
-      let market: string | null = null;
-      if (gisKey) {
-        try {
-          const u = new URL('https://www.redfin.com' + gisKey);
-          region_id = u.searchParams.get('region_id');
-          region_type = u.searchParams.get('region_type');
-          market = u.searchParams.get('market');
-        } catch (e) {}
-      }
-      return {
-        region_id,
-        region_type: region_type || '2',
-        market,
-        title: document.title,
-        url: window.location.href
-      };
-    });
+    const extracted = await withBrowser(launchOptionsWithProxy(lane.proxy), ZIPCODE_RENDER_DEADLINE_MS, `Zipcode page ${url}`, (browser) => readZipcodePage(browser, url, lane));
 
     if (!extracted.region_id) {
       throw new Error('Redfin region id not found on zipcode page');
@@ -1795,18 +1898,45 @@ async function renderZipcodePage(url: string, trace: RequestTrace): Promise<Fetc
     };
   } catch (err: any) {
     trace.recordError('browser', 1, err, startedAt, { lane: lane.id });
-    if (browser) {
-      await browser.close().catch(() => {});
-      browser = undefined;
-    }
     if (BRIGHTDATA_API_KEY) {
       console.warn(`[Fetcher] Camoufox failed for ${url} (${err.message}). Escalating to Bright Data Web Unlocker...`);
       return await fetchZipcodeWithBrightData(url, trace, 1);
     }
     throw err;
-  } finally {
-    if (browser) await browser.close().catch(() => {});
   }
+}
+
+async function readZipcodePage(browser: Browser, url: string, lane: RedfinLane) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(3000);
+
+  lane.absorb(await context.cookies());
+
+  return await page.evaluate(() => {
+    const state = (window as any).__reactServerState;
+    const cache = state?.InitialContext?.['ReactServerAgent.cache']?.dataCache || {};
+    const gisKey = Object.keys(cache).find(k => k.includes('gis'));
+    let region_id: string | null = null;
+    let region_type: string | null = null;
+    let market: string | null = null;
+    if (gisKey) {
+      try {
+        const u = new URL('https://www.redfin.com' + gisKey);
+        region_id = u.searchParams.get('region_id');
+        region_type = u.searchParams.get('region_type');
+        market = u.searchParams.get('market');
+      } catch (e) {}
+    }
+    return {
+      region_id,
+      region_type: region_type || '2',
+      market,
+      title: document.title,
+      url: window.location.href
+    };
+  });
 }
 
 // The /fetch request to Redfin, through the lane's proxy with the lane's cookies
@@ -1894,11 +2024,13 @@ async function fetchRedfinLayers(url: string, trace: RequestTrace): Promise<Fetc
   let lane = pickRedfinLane();
   let lastBlock: { status: number; finalUrl: string } | null = null;
   let lastRefusal: ProxyRefusedError | null = null;
+  // Both attempts share one wait budget
+  const waitUntil = Date.now() + COOKIE_WAIT_MAX_MS;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     if (attempt === 2) lane = pickRedfinLane(lane);
     if (!lane.hasToken()) {
-      await waitForCookieRefresh(lane, trace, attempt);
+      await waitForCookieRefresh(lane, trace, attempt, waitUntil - Date.now());
     } else if (lane.needsRefreshSoon()) {
       // An old token is used as it is, since one past 20 minutes still got through 8 of 10 times in production
       // (2026-10-23/24); the refresh runs alongside, and a block still moves the retry to another lane
@@ -2084,11 +2216,17 @@ app.get('/health', (_req: Request, res: Response) => {
     return acc;
   }, {} as Record<string, any>);
 
+  // Redfin requests aren't sent without a token, so they never reach the stats deriveStatus reads: with no lane holding
+  // one, actives were down for a week while this said "ok" (2026-11-04 to 11-11)
+  const status = deriveStatus();
+  const anyToken = redfinLanes.some((lane) => lane.hasToken());
+
   res.json({
-    status: deriveStatus(),
+    status: status === 'ok' && !anyToken ? 'degraded' : status,
     uptime: process.uptime(),
     stats: formattedStats,
     redfinLanes: redfinLanes.map((lane) => lane.status()),
+    browsers: { ...browserCounts, processes: processStats() },
     layers: getLayerStats(),
   });
 });

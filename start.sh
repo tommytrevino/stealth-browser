@@ -11,5 +11,5 @@ sleep 1
 # Export display variable
 export DISPLAY=:99
 
-# Start Node server as PID 1
+# Start Node server in place of this shell, as tini's child (tini is PID 1 and reaps orphans)
 exec node dist/server.js
